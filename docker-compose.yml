@@ -1,0 +1,49 @@
+services:
+  app-db:
+    image: postgres:16-alpine
+    container_name: pgvault-app-db
+    environment:
+      POSTGRES_USER: pgvault
+      POSTGRES_PASSWORD: pgvault_dev_password
+      POSTGRES_DB: pgvault
+    ports:
+      - "5432:5432"
+    volumes:
+      - app_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pgvault -d pgvault"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  target-db:
+    image: postgres:16-alpine
+    container_name: pgvault-target-db
+    environment:
+      POSTGRES_USER: target_admin
+      POSTGRES_PASSWORD: target_dev_password
+      POSTGRES_DB: customer_app
+    ports:
+      - "5433:5432"
+    volumes:
+      - target_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U target_admin -d customer_app"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  s3:
+    image: localstack/localstack:latest
+    container_name: pgvault-s3
+    environment:
+      SERVICES: s3
+    ports:
+      - "4566:4566"
+    volumes:
+      - s3_data:/var/lib/localstack
+
+volumes:
+  app_db_data:
+  target_db_data:
+  s3_data:
