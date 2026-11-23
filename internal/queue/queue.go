@@ -326,3 +326,59 @@ func GetJob(ctx context.Context, pool *pgxpool.Pool, jobID int64) (*Job, error) 
 	}
 	return &job, nil
 }
+
+// ListJobs returns backup jobs optionally filtered by targetID and/or status, ordered newest first.
+func ListJobs(ctx context.Context, pool *pgxpool.Pool, targetID *int64, status string, limit int) ([]Job, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+
+	var (
+		clauses []string
+		args    []any
+		argIdx  = 1
+	)
+	if targetID != nil {
+		clauses = append(clauses, fmt.Sprintf("target_id = $%d", argIdx))
+		args = append(args, *targetID)
+		argIdx++
+	}
+	if strings.TrimSpace(status) != "" {
+		clauses = append(clauses, fmt.Sprintf("status = $%d", argIdx))
+		args = append(args, strings.TrimSpace(status))
+		argIdx++
+	}
+
+	query := `
+		SELECT id, target_id, status, attempts, max_attempts, run_after,
+			locked_at, COALESCE(locked_by, ''), started_at, finished_at, error_message, created_at
+		FROM backup_jobs
+	`
+	if len(clauses) > 0 {
+		query += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	query += fmt.Sprintf(" ORDER BY created_at DESC, id DESC LIMIT $%d", argIdx)
+	args = append(args, limit)
+
+	rows, err := pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("queue: list jobs: %w", err)
+	}
+	defer rows.Close()
+
+	jobs := make([]Job, 0)
+	for rows.Next() {
+		var job Job
+		if err := rows.Scan(
+			&job.ID, &job.TargetID, &job.Status, &job.Attempts, &job.MaxAttempts, &job.RunAfter,
+			&job.LockedAt, &job.LockedBy, &job.StartedAt, &job.FinishedAt, &job.ErrorMessage, &job.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("queue: scan job: %w", err)
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("queue: iterate jobs: %w", err)
+	}
+	return jobs, nil
+}

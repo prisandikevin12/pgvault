@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prisandikevin12/pgvault/internal/crypto"
 	"github.com/prisandikevin12/pgvault/internal/pgdump"
@@ -270,6 +271,83 @@ func GetTarget(ctx context.Context, pool *pgxpool.Pool, id int64) (*BackupTarget
 	return &out, nil
 }
 
+// ListTargets returns all backup targets ordered newest first.
+func ListTargets(ctx context.Context, pool *pgxpool.Pool) ([]BackupTarget, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT id, name, target_dsn, storage_endpoint, storage_region, storage_bucket,
+			storage_access_key, storage_secret_key, storage_force_path_style,
+			sanity_query, schedule_cron, interval_seconds, created_at, updated_at
+		FROM backup_targets
+		ORDER BY created_at DESC, id DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("db: list backup targets: %w", err)
+	}
+	defer rows.Close()
+
+	targets := make([]BackupTarget, 0)
+	for rows.Next() {
+		var out BackupTarget
+		if err := rows.Scan(
+			&out.ID, &out.Name, &out.TargetDSN, &out.StorageEndpoint, &out.StorageRegion, &out.StorageBucket,
+			&out.StorageAccessKey, &out.StorageSecretKey, &out.StorageForcePathStyle,
+			&out.SanityQuery, &out.ScheduleCron, &out.IntervalSeconds, &out.CreatedAt, &out.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("db: scan backup target: %w", err)
+		}
+		targets = append(targets, out)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterate backup targets: %w", err)
+	}
+	return targets, nil
+}
+
+// UpdateTarget updates all mutable columns of an existing backup target.
+func UpdateTarget(ctx context.Context, pool *pgxpool.Pool, t BackupTarget) (*BackupTarget, error) {
+	var out BackupTarget
+	err := pool.QueryRow(ctx, `
+		UPDATE backup_targets
+		SET name = $2,
+			target_dsn = $3,
+			storage_endpoint = $4,
+			storage_region = $5,
+			storage_bucket = $6,
+			storage_access_key = $7,
+			storage_secret_key = $8,
+			storage_force_path_style = $9,
+			sanity_query = $10,
+			schedule_cron = $11,
+			interval_seconds = $12,
+			updated_at = NOW()
+		WHERE id = $1
+		RETURNING id, name, target_dsn, storage_endpoint, storage_region, storage_bucket,
+			storage_access_key, storage_secret_key, storage_force_path_style,
+			sanity_query, schedule_cron, interval_seconds, created_at, updated_at
+	`,
+		t.ID, t.Name, t.TargetDSN, t.StorageEndpoint, t.StorageRegion, t.StorageBucket,
+		t.StorageAccessKey, t.StorageSecretKey, t.StorageForcePathStyle,
+		t.SanityQuery, t.ScheduleCron, t.IntervalSeconds,
+	).Scan(
+		&out.ID, &out.Name, &out.TargetDSN, &out.StorageEndpoint, &out.StorageRegion, &out.StorageBucket,
+		&out.StorageAccessKey, &out.StorageSecretKey, &out.StorageForcePathStyle,
+		&out.SanityQuery, &out.ScheduleCron, &out.IntervalSeconds, &out.CreatedAt, &out.UpdatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("db: update backup target %d: %w", t.ID, err)
+	}
+	return &out, nil
+}
+
+// DeleteTarget deletes a backup target by ID. Returns true if a row was deleted.
+func DeleteTarget(ctx context.Context, pool *pgxpool.Pool, id int64) (bool, error) {
+	tag, err := pool.Exec(ctx, "DELETE FROM backup_targets WHERE id = $1", id)
+	if err != nil {
+		return false, fmt.Errorf("db: delete backup target %d: %w", id, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // CreateArtifact inserts a backup_artifacts record for a completed backup upload.
 func CreateArtifact(ctx context.Context, pool *pgxpool.Pool, a BackupArtifact) (*BackupArtifact, error) {
 	tables := a.Tables
@@ -405,4 +483,164 @@ func ListActiveAlertChannels(ctx context.Context, pool *pgxpool.Pool, targetID i
 		return nil, fmt.Errorf("db: iterate alert channels: %w", err)
 	}
 	return channels, nil
+}
+
+// ListArtifacts returns backup artifacts optionally filtered by targetID, ordered newest first.
+func ListArtifacts(ctx context.Context, pool *pgxpool.Pool, targetID *int64, limit int) ([]BackupArtifact, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+
+	var (
+		rows pgx.Rows
+		err  error
+	)
+	if targetID != nil {
+		rows, err = pool.Query(ctx, `
+			SELECT id, job_id, target_id, object_key, wrapped_dek, plaintext_bytes,
+				ciphertext_bytes, ciphertext_sha256, pg_major_version, tables_json,
+				verification_passed, restore_duration_ms, verification_error, created_at
+			FROM backup_artifacts
+			WHERE target_id = $1
+			ORDER BY created_at DESC, id DESC
+			LIMIT $2
+		`, *targetID, limit)
+	} else {
+		rows, err = pool.Query(ctx, `
+			SELECT id, job_id, target_id, object_key, wrapped_dek, plaintext_bytes,
+				ciphertext_bytes, ciphertext_sha256, pg_major_version, tables_json,
+				verification_passed, restore_duration_ms, verification_error, created_at
+			FROM backup_artifacts
+			ORDER BY created_at DESC, id DESC
+			LIMIT $1
+		`, limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db: list artifacts: %w", err)
+	}
+	defer rows.Close()
+
+	artifacts := make([]BackupArtifact, 0)
+	for rows.Next() {
+		var out BackupArtifact
+		var rawTables []byte
+		if err := rows.Scan(
+			&out.ID, &out.JobID, &out.TargetID, &out.ObjectKey, &out.WrappedDEK, &out.PlaintextBytes,
+			&out.CiphertextBytes, &out.CiphertextSHA256, &out.PGMajorVersion, &rawTables,
+			&out.VerificationPassed, &out.RestoreDurationMs, &out.VerificationError, &out.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("db: scan artifact: %w", err)
+		}
+		if err := json.Unmarshal(rawTables, &out.Tables); err != nil {
+			return nil, fmt.Errorf("db: unmarshal artifact tables_json: %w", err)
+		}
+		artifacts = append(artifacts, out)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterate artifacts: %w", err)
+	}
+	return artifacts, nil
+}
+
+// ListAllAlertChannels returns all configured alert channels ordered by ID.
+func ListAllAlertChannels(ctx context.Context, pool *pgxpool.Pool) ([]AlertChannel, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT id, target_id, channel_type, bot_token, chat_id,
+			notify_on_failure, notify_on_success, enabled, created_at, updated_at
+		FROM alert_channels
+		ORDER BY id ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("db: list alert channels: %w", err)
+	}
+	defer rows.Close()
+
+	channels := make([]AlertChannel, 0)
+	for rows.Next() {
+		var ch AlertChannel
+		if err := rows.Scan(
+			&ch.ID, &ch.TargetID, &ch.ChannelType, &ch.BotToken, &ch.ChatID,
+			&ch.NotifyOnFailure, &ch.NotifyOnSuccess, &ch.Enabled, &ch.CreatedAt, &ch.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("db: scan alert channel: %w", err)
+		}
+		channels = append(channels, ch)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: iterate alert channels: %w", err)
+	}
+	return channels, nil
+}
+
+// UpsertTelegramAlertChannel creates or updates the Telegram alert channel for targetID (or global when nil).
+// If updating an existing channel and ch.BotToken is empty, the existing bot_token is preserved.
+func UpsertTelegramAlertChannel(ctx context.Context, pool *pgxpool.Pool, ch AlertChannel) (*AlertChannel, error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("db: begin upsert alert tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var existingID int64
+	var existingToken string
+	if ch.TargetID == nil {
+		err = tx.QueryRow(ctx, `
+			SELECT id, bot_token FROM alert_channels
+			WHERE channel_type = 'telegram' AND target_id IS NULL
+			ORDER BY id ASC LIMIT 1
+			FOR UPDATE
+		`).Scan(&existingID, &existingToken)
+	} else {
+		err = tx.QueryRow(ctx, `
+			SELECT id, bot_token FROM alert_channels
+			WHERE channel_type = 'telegram' AND target_id = $1
+			ORDER BY id ASC LIMIT 1
+			FOR UPDATE
+		`, *ch.TargetID).Scan(&existingID, &existingToken)
+	}
+
+	var out AlertChannel
+	if errors.Is(err, pgx.ErrNoRows) {
+		if strings.TrimSpace(ch.BotToken) == "" {
+			return nil, errors.New("db: bot_token is required when creating telegram alert channel")
+		}
+		err = tx.QueryRow(ctx, `
+			INSERT INTO alert_channels (
+				target_id, channel_type, bot_token, chat_id,
+				notify_on_failure, notify_on_success, enabled
+			) VALUES ($1, 'telegram', $2, $3, $4, $5, $6)
+			RETURNING id, target_id, channel_type, bot_token, chat_id,
+				notify_on_failure, notify_on_success, enabled, created_at, updated_at
+		`, ch.TargetID, ch.BotToken, ch.ChatID, ch.NotifyOnFailure, ch.NotifyOnSuccess, ch.Enabled).Scan(
+			&out.ID, &out.TargetID, &out.ChannelType, &out.BotToken, &out.ChatID,
+			&out.NotifyOnFailure, &out.NotifyOnSuccess, &out.Enabled, &out.CreatedAt, &out.UpdatedAt,
+		)
+	} else if err == nil {
+		tokenToStore := ch.BotToken
+		if strings.TrimSpace(tokenToStore) == "" {
+			tokenToStore = existingToken
+		}
+		err = tx.QueryRow(ctx, `
+			UPDATE alert_channels
+			SET bot_token = $2,
+				chat_id = $3,
+				notify_on_failure = $4,
+				notify_on_success = $5,
+				enabled = $6,
+				updated_at = NOW()
+			WHERE id = $1
+			RETURNING id, target_id, channel_type, bot_token, chat_id,
+				notify_on_failure, notify_on_success, enabled, created_at, updated_at
+		`, existingID, tokenToStore, ch.ChatID, ch.NotifyOnFailure, ch.NotifyOnSuccess, ch.Enabled).Scan(
+			&out.ID, &out.TargetID, &out.ChannelType, &out.BotToken, &out.ChatID,
+			&out.NotifyOnFailure, &out.NotifyOnSuccess, &out.Enabled, &out.CreatedAt, &out.UpdatedAt,
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db: upsert telegram alert channel: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("db: commit upsert alert tx: %w", err)
+	}
+	return &out, nil
 }
