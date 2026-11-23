@@ -45,14 +45,7 @@ func loadEnvConfig(getenv func(string) string) (apiEnvConfig, error) {
 		addr = defaultListenAddr
 	}
 
-	var origins []string
-	if raw := strings.TrimSpace(getenv("PGVAULT_CORS_ORIGINS")); raw != "" {
-		for _, part := range strings.Split(raw, ",") {
-			if p := strings.TrimSpace(part); p != "" {
-				origins = append(origins, p)
-			}
-		}
-	}
+	origins := api.ParseCORSOrigins(getenv("PGVAULT_CORS_ORIGINS"))
 
 	return apiEnvConfig{
 		DBDSN:          dsn,

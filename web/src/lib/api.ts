@@ -93,6 +93,20 @@ export interface APIConfig {
   apiKey: string;
 }
 
+export function resolveDefaultApiBaseUrl(): string {
+  const envUrl = process.env.NEXT_PUBLIC_API_URL?.trim();
+  if (envUrl) {
+    return envUrl.replace(/\/+$/, "");
+  }
+  if (typeof window !== "undefined") {
+    const { hostname, origin } = window.location;
+    if (hostname && hostname !== "localhost" && hostname !== "127.0.0.1") {
+      return origin.replace(/\/+$/, "");
+    }
+  }
+  return "http://127.0.0.1:8080";
+}
+
 async function request<T>(
   cfg: APIConfig,
   path: string,

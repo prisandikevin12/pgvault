@@ -48,6 +48,22 @@ type Server struct {
 	handler        http.Handler
 }
 
+// ParseCORSOrigins parses a comma-separated list of CORS origins, trimming whitespace
+// and trailing slashes. When empty, it defaults to localhost:3000 and 127.0.0.1:3000.
+func ParseCORSOrigins(raw string) []string {
+	var origins []string
+	for _, part := range strings.Split(raw, ",") {
+		p := strings.TrimRight(strings.TrimSpace(part), "/")
+		if p != "" {
+			origins = append(origins, p)
+		}
+	}
+	if len(origins) == 0 {
+		return []string{"http://localhost:3000", "http://127.0.0.1:3000"}
+	}
+	return origins
+}
+
 // NewServer constructs a configured HTTP API Server.
 func NewServer(pool *pgxpool.Pool, cfg Config) (*Server, error) {
 	if len(cfg.KEK) != crypto.KeySize {
@@ -56,11 +72,11 @@ func NewServer(pool *pgxpool.Pool, cfg Config) (*Server, error) {
 
 	origins := cfg.AllowedOrigins
 	if len(origins) == 0 {
-		origins = []string{"http://localhost:3000", "http://127.0.0.1:3000"}
+		origins = ParseCORSOrigins("")
 	}
 	originSet := make(map[string]bool, len(origins))
 	for _, o := range origins {
-		o = strings.TrimSpace(o)
+		o = strings.TrimRight(strings.TrimSpace(o), "/")
 		if o != "" {
 			originSet[o] = true
 		}
@@ -115,13 +131,15 @@ func (s *Server) buildHandler() http.Handler {
 
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != "" && s.allowedOrigins[origin] {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
+		origin := strings.TrimRight(strings.TrimSpace(r.Header.Get("Origin")), "/")
+		if origin != "" {
 			w.Header().Add("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, X-API-Key, Content-Type")
-			w.Header().Set("Access-Control-Max-Age", "600")
+			if s.allowedOrigins[origin] {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, X-API-Key, Content-Type")
+				w.Header().Set("Access-Control-Max-Age", "600")
+			}
 		}
 
 		if r.Method == http.MethodOptions {

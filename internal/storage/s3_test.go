@@ -33,6 +33,30 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "valid_cloudflare_r2_https",
+			cfg: Config{
+				EndpointURL:     "https://0123456789abcdef.r2.cloudflarestorage.com",
+				Region:          "auto",
+				Bucket:          "prod-db-backups",
+				AccessKeyID:     "r2-access-key",
+				SecretAccessKey: "r2-secret-key",
+				ForcePathStyle:  false,
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid_private_ip_minio",
+			cfg: Config{
+				EndpointURL:     "http://10.20.0.15:9000",
+				Region:          "us-east-1",
+				Bucket:          "internal-backups",
+				AccessKeyID:     "minioadmin",
+				SecretAccessKey: "minioadmin",
+				ForcePathStyle:  true,
+			},
+			wantErr: false,
+		},
+		{
 			name: "missing_bucket",
 			cfg: Config{
 				Region: "us-east-1",

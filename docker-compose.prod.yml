@@ -1,0 +1,87 @@
+services:
+  app-db:
+    image: postgres:16-alpine
+    container_name: pgvault-app-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pgvault}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-pgvault}
+    volumes:
+      - pgvault_app_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pgvault} -d ${POSTGRES_DB:-pgvault}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - pgvault-internal
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    container_name: pgvault-api
+    restart: unless-stopped
+    depends_on:
+      app-db:
+        condition: service_healthy
+    environment:
+      PGVAULT_DB_DSN: ${PGVAULT_DB_DSN:?set PGVAULT_DB_DSN in .env}
+      PGVAULT_KEK_HEX: ${PGVAULT_KEK_HEX:?set PGVAULT_KEK_HEX in .env}
+      PGVAULT_API_KEY: ${PGVAULT_API_KEY:-}
+      PGVAULT_API_ADDR: ${PGVAULT_API_ADDR:-:8080}
+      PGVAULT_CORS_ORIGINS: ${PGVAULT_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+    ports:
+      - "${PGVAULT_API_PORT:-8080}:8080"
+    networks:
+      - pgvault-internal
+      - pgvault-edge
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    container_name: pgvault-worker
+    restart: unless-stopped
+    depends_on:
+      app-db:
+        condition: service_healthy
+    environment:
+      PGVAULT_DB_DSN: ${PGVAULT_DB_DSN:?set PGVAULT_DB_DSN in .env}
+      PGVAULT_KEK_HEX: ${PGVAULT_KEK_HEX:?set PGVAULT_KEK_HEX in .env}
+      PGVAULT_WORKER_ID: ${PGVAULT_WORKER_ID:-pgvault-worker-1}
+      PGVAULT_POLL_INTERVAL: ${PGVAULT_POLL_INTERVAL:-5s}
+    volumes:
+      # Required by internal/verifier to launch ephemeral NetworkMode="none" PostgreSQL containers
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-999}"
+    networks:
+      - pgvault-internal
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
+    container_name: pgvault-web
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${PGVAULT_WEB_PORT:-3000}:3000"
+    networks:
+      - pgvault-edge
+
+volumes:
+  pgvault_app_db_data:
+
+networks:
+  pgvault-internal:
+    driver: bridge
+  pgvault-edge:
+    driver: bridge

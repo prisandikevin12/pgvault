@@ -14,6 +14,7 @@ import {
   listArtifacts,
   listJobs,
   listTargets,
+  resolveDefaultApiBaseUrl,
   Target,
   triggerBackup,
   upsertTelegramAlert,
@@ -21,7 +22,6 @@ import {
 
 const STORAGE_KEY_URL = "pgvault_api_base_url";
 const STORAGE_KEY_API_KEY = "pgvault_api_key";
-const DEFAULT_API_URL = "http://127.0.0.1:8080";
 
 type TabKey = "targets" | "jobs" | "alerts";
 
@@ -40,7 +40,7 @@ function jobStatusBadge(status: string): string {
 }
 
 export default function DashboardPage() {
-  const [baseUrl, setBaseUrl] = useState(DEFAULT_API_URL);
+  const [baseUrl, setBaseUrl] = useState(() => resolveDefaultApiBaseUrl());
   const [apiKey, setApiKey] = useState("");
   const [configLoaded, setConfigLoaded] = useState(false);
 
@@ -58,12 +58,12 @@ export default function DashboardPage() {
   // Create target form state
   const [targetName, setTargetName] = useState("");
   const [targetDSN, setTargetDSN] = useState("");
-  const [storageEndpoint, setStorageEndpoint] = useState("http://127.0.0.1:4566");
+  const [storageEndpoint, setStorageEndpoint] = useState("");
   const [storageRegion, setStorageRegion] = useState("us-east-1");
   const [storageBucket, setStorageBucket] = useState("");
   const [storageAccessKey, setStorageAccessKey] = useState("");
   const [storageSecretKey, setStorageSecretKey] = useState("");
-  const [forcePathStyle, setForcePathStyle] = useState(true);
+  const [forcePathStyle, setForcePathStyle] = useState(false);
   const [intervalSeconds, setIntervalSeconds] = useState(86400);
   const [sanityQuery, setSanityQuery] = useState("");
   const [submittingTarget, setSubmittingTarget] = useState(false);
@@ -80,13 +80,17 @@ export default function DashboardPage() {
   useEffect(() => {
     const savedUrl = window.localStorage.getItem(STORAGE_KEY_URL);
     const savedKey = window.localStorage.getItem(STORAGE_KEY_API_KEY);
-    if (savedUrl) setBaseUrl(savedUrl);
+    if (savedUrl && savedUrl.trim() !== "") {
+      setBaseUrl(savedUrl);
+    } else {
+      setBaseUrl(resolveDefaultApiBaseUrl());
+    }
     if (savedKey) setApiKey(savedKey);
     setConfigLoaded(true);
   }, []);
 
   const apiCfg: APIConfig = useMemo(
-    () => ({ baseUrl: baseUrl.trim() || DEFAULT_API_URL, apiKey }),
+    () => ({ baseUrl: baseUrl.trim() || resolveDefaultApiBaseUrl(), apiKey }),
     [baseUrl, apiKey]
   );
 
@@ -273,7 +277,7 @@ export default function DashboardPage() {
               type="text"
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder="http://127.0.0.1:8080"
+              placeholder="https://api.pgvault.example.com"
               required
             />
           </div>
@@ -469,7 +473,7 @@ export default function DashboardPage() {
                   type="text"
                   value={storageEndpoint}
                   onChange={(e) => setStorageEndpoint(e.target.value)}
-                  placeholder="http://127.0.0.1:4566"
+                  placeholder="https://<account>.r2.cloudflarestorage.com or http://10.0.0.5:4566"
                 />
               </div>
               <div className="field">
