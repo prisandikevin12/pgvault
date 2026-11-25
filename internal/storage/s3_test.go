@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"testing"
+
+	"github.com/aws/smithy-go"
 )
 
 func TestConfigValidate(t *testing.T) {
@@ -169,5 +171,20 @@ func TestClient_MethodInputValidation(t *testing.T) {
 	}
 	if err := client.DeleteObject(ctx, ""); err == nil {
 		t.Errorf("DeleteObject() with empty key succeeded, want error")
+	}
+	if err := client.DeleteObjects(ctx, nil); err != nil {
+		t.Errorf("DeleteObjects(nil) unexpected error: %v", err)
+	}
+}
+
+func TestIsNotFoundError(t *testing.T) {
+	if !IsNotFoundError(&smithy.GenericAPIError{Code: "NoSuchKey", Message: "missing"}) {
+		t.Errorf("IsNotFoundError(NoSuchKey) = false, want true")
+	}
+	if !IsNotFoundError(&smithy.GenericAPIError{Code: "NotFound", Message: "missing"}) {
+		t.Errorf("IsNotFoundError(NotFound) = false, want true")
+	}
+	if IsNotFoundError(&smithy.GenericAPIError{Code: "AccessDenied", Message: "denied"}) {
+		t.Errorf("IsNotFoundError(AccessDenied) = true, want false")
 	}
 }

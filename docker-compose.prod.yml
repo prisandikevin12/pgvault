@@ -54,6 +54,9 @@ services:
       PGVAULT_KEK_HEX: ${PGVAULT_KEK_HEX:?set PGVAULT_KEK_HEX in .env}
       PGVAULT_WORKER_ID: ${PGVAULT_WORKER_ID:-pgvault-worker-1}
       PGVAULT_POLL_INTERVAL: ${PGVAULT_POLL_INTERVAL:-5s}
+      PGVAULT_SCHEDULER_INTERVAL: ${PGVAULT_SCHEDULER_INTERVAL:-15s}
+      PGVAULT_PRUNE_INTERVAL: ${PGVAULT_PRUNE_INTERVAL:-1m}
+      PGVAULT_JOB_LEASE_DURATION: ${PGVAULT_JOB_LEASE_DURATION:-15m}
     volumes:
       # Required by internal/verifier to launch ephemeral NetworkMode="none" PostgreSQL containers
       - /var/run/docker.sock:/var/run/docker.sock

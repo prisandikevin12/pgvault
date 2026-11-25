@@ -35,7 +35,7 @@ func TestAPI_Integration_FullLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConnectPool() error: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 
 	if err := db.ApplyMigrations(ctx, pool); err != nil {
 		t.Fatalf("ApplyMigrations() error: %v", err)
@@ -113,6 +113,8 @@ func TestAPI_Integration_FullLifecycle(t *testing.T) {
 		StorageForcePathStyle: true,
 		SanityQuery:           "SELECT 1",
 		IntervalSeconds:       3600,
+		RetentionKeepLast:     5,
+		RetentionMaxAgeDays:   30,
 	}, true)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("POST /api/v1/targets status = %d, want 201 (body=%s)", resp.StatusCode, string(raw))
@@ -157,17 +159,31 @@ func TestAPI_Integration_FullLifecycle(t *testing.T) {
 	// 4. PATCH /api/v1/targets/{id}
 	newInterval := 7200
 	newQuery := "SELECT count(*) FROM public.orders"
+	newKeepLast := 3
+	newMaxAge := 14
 	resp, raw = doReq(http.MethodPatch, fmt.Sprintf("/api/v1/targets/%d", createdTarget.ID), UpdateTargetRequest{
-		IntervalSeconds: &newInterval,
-		SanityQuery:     &newQuery,
+		IntervalSeconds:     &newInterval,
+		SanityQuery:         &newQuery,
+		RetentionKeepLast:   &newKeepLast,
+		RetentionMaxAgeDays: &newMaxAge,
 	}, true)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("PATCH /api/v1/targets/{id} status = %d, want 200 (body=%s)", resp.StatusCode, string(raw))
 	}
 	var patchedTarget TargetResponse
 	_ = json.Unmarshal(raw, &patchedTarget)
-	if patchedTarget.IntervalSeconds != 7200 || patchedTarget.SanityQuery != newQuery {
+	if patchedTarget.IntervalSeconds != 7200 || patchedTarget.SanityQuery != newQuery ||
+		patchedTarget.RetentionKeepLast != 3 || patchedTarget.RetentionMaxAgeDays != 14 {
 		t.Fatalf("PATCH result mismatch: %+v", patchedTarget)
+	}
+
+	// Negative retention value on PATCH must return 400 Bad Request
+	neg := -2
+	resp, _ = doReq(http.MethodPatch, fmt.Sprintf("/api/v1/targets/%d", createdTarget.ID), UpdateTargetRequest{
+		RetentionKeepLast: &neg,
+	}, true)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PATCH with negative retention_keep_last status = %d, want 400", resp.StatusCode)
 	}
 
 	// 5. POST /api/v1/targets/{id}/backups -> 202 Accepted

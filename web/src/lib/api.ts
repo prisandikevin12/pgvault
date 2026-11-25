@@ -17,6 +17,9 @@ export interface Target {
   sanity_query: string;
   schedule_cron: string;
   interval_seconds: number;
+  retention_keep_last: number;
+  retention_max_age_days: number;
+  last_scheduled_at?: string;
   created_at: string;
   updated_at: string;
 }
@@ -32,6 +35,8 @@ export interface CreateTargetInput {
   storage_force_path_style: boolean;
   sanity_query: string;
   interval_seconds: number;
+  retention_keep_last: number;
+  retention_max_age_days: number;
 }
 
 export interface Artifact {
@@ -47,6 +52,7 @@ export interface Artifact {
   verification_passed: boolean;
   restore_duration_ms: number;
   verification_error: string;
+  pruned_at?: string;
   created_at: string;
 }
 

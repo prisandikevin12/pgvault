@@ -25,7 +25,7 @@ func TestApplyMigrations_Integration_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConnectPool() error: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 
 	// Calling ApplyMigrations twice must succeed idempotently.
 	if err := ApplyMigrations(ctx, pool); err != nil {
@@ -49,6 +49,29 @@ func TestApplyMigrations_Integration_Idempotent(t *testing.T) {
 		}
 		if !exists {
 			t.Fatalf("expected table %q to exist after ApplyMigrations", tbl)
+		}
+	}
+
+	// Verify 002 scheduler/lease & 003 retention columns exist.
+	for _, col := range [][2]string{
+		{"backup_targets", "last_scheduled_at"},
+		{"backup_targets", "retention_keep_last"},
+		{"backup_targets", "retention_max_age_days"},
+		{"backup_jobs", "lease_expires_at"},
+		{"backup_artifacts", "pruned_at"},
+	} {
+		var colExists bool
+		err := pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+			)
+		`, col[0], col[1]).Scan(&colExists)
+		if err != nil {
+			t.Fatalf("check column %s.%s error: %v", col[0], col[1], err)
+		}
+		if !colExists {
+			t.Fatalf("expected column %s.%s to exist after ApplyMigrations", col[0], col[1])
 		}
 	}
 

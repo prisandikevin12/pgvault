@@ -343,6 +343,28 @@ func TestValidateCreateTargetInput(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "negative_retention_keep_last",
+			in: CreateTargetRequest{
+				Name:              "prod-db",
+				TargetDSN:         "postgres://u:p@localhost:5432/db",
+				StorageRegion:     "us-east-1",
+				StorageBucket:     "backups",
+				RetentionKeepLast: -1,
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative_retention_max_age_days",
+			in: CreateTargetRequest{
+				Name:                "prod-db",
+				TargetDSN:           "postgres://u:p@localhost:5432/db",
+				StorageRegion:       "us-east-1",
+				StorageBucket:       "backups",
+				RetentionMaxAgeDays: -5,
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range cases {

@@ -42,6 +42,9 @@ type BackupTarget struct {
 	SanityQuery           string
 	ScheduleCron          string
 	IntervalSeconds       int
+	RetentionKeepLast     int
+	RetentionMaxAgeDays   int
+	LastScheduledAt       *time.Time
 	CreatedAt             time.Time
 	UpdatedAt             time.Time
 }
@@ -61,6 +64,7 @@ type BackupArtifact struct {
 	VerificationPassed bool
 	RestoreDurationMs  int64
 	VerificationError  string
+	PrunedAt           *time.Time
 	CreatedAt          time.Time
 }
 
@@ -225,25 +229,32 @@ func CreateTarget(ctx context.Context, pool *pgxpool.Pool, t BackupTarget) (*Bac
 	if t.IntervalSeconds <= 0 {
 		t.IntervalSeconds = 86400
 	}
+	if t.RetentionKeepLast < 0 || t.RetentionMaxAgeDays < 0 {
+		return nil, errors.New("db: retention policy values must be non-negative")
+	}
 
 	var out BackupTarget
 	err := pool.QueryRow(ctx, `
 		INSERT INTO backup_targets (
 			name, target_dsn, storage_endpoint, storage_region, storage_bucket,
 			storage_access_key, storage_secret_key, storage_force_path_style,
-			sanity_query, schedule_cron, interval_seconds
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			sanity_query, schedule_cron, interval_seconds,
+			retention_keep_last, retention_max_age_days
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
 		RETURNING id, name, target_dsn, storage_endpoint, storage_region, storage_bucket,
 			storage_access_key, storage_secret_key, storage_force_path_style,
-			sanity_query, schedule_cron, interval_seconds, created_at, updated_at
+			sanity_query, schedule_cron, interval_seconds,
+			retention_keep_last, retention_max_age_days, last_scheduled_at, created_at, updated_at
 	`,
 		t.Name, t.TargetDSN, t.StorageEndpoint, t.StorageRegion, t.StorageBucket,
 		t.StorageAccessKey, t.StorageSecretKey, t.StorageForcePathStyle,
 		t.SanityQuery, t.ScheduleCron, t.IntervalSeconds,
+		t.RetentionKeepLast, t.RetentionMaxAgeDays,
 	).Scan(
 		&out.ID, &out.Name, &out.TargetDSN, &out.StorageEndpoint, &out.StorageRegion, &out.StorageBucket,
 		&out.StorageAccessKey, &out.StorageSecretKey, &out.StorageForcePathStyle,
-		&out.SanityQuery, &out.ScheduleCron, &out.IntervalSeconds, &out.CreatedAt, &out.UpdatedAt,
+		&out.SanityQuery, &out.ScheduleCron, &out.IntervalSeconds,
+		&out.RetentionKeepLast, &out.RetentionMaxAgeDays, &out.LastScheduledAt, &out.CreatedAt, &out.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("db: create backup target: %w", err)
@@ -257,13 +268,15 @@ func GetTarget(ctx context.Context, pool *pgxpool.Pool, id int64) (*BackupTarget
 	err := pool.QueryRow(ctx, `
 		SELECT id, name, target_dsn, storage_endpoint, storage_region, storage_bucket,
 			storage_access_key, storage_secret_key, storage_force_path_style,
-			sanity_query, schedule_cron, interval_seconds, created_at, updated_at
+			sanity_query, schedule_cron, interval_seconds,
+			retention_keep_last, retention_max_age_days, last_scheduled_at, created_at, updated_at
 		FROM backup_targets
 		WHERE id = $1
 	`, id).Scan(
 		&out.ID, &out.Name, &out.TargetDSN, &out.StorageEndpoint, &out.StorageRegion, &out.StorageBucket,
 		&out.StorageAccessKey, &out.StorageSecretKey, &out.StorageForcePathStyle,
-		&out.SanityQuery, &out.ScheduleCron, &out.IntervalSeconds, &out.CreatedAt, &out.UpdatedAt,
+		&out.SanityQuery, &out.ScheduleCron, &out.IntervalSeconds,
+		&out.RetentionKeepLast, &out.RetentionMaxAgeDays, &out.LastScheduledAt, &out.CreatedAt, &out.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("db: get backup target %d: %w", id, err)
@@ -276,7 +289,8 @@ func ListTargets(ctx context.Context, pool *pgxpool.Pool) ([]BackupTarget, error
 	rows, err := pool.Query(ctx, `
 		SELECT id, name, target_dsn, storage_endpoint, storage_region, storage_bucket,
 			storage_access_key, storage_secret_key, storage_force_path_style,
-			sanity_query, schedule_cron, interval_seconds, created_at, updated_at
+			sanity_query, schedule_cron, interval_seconds,
+			retention_keep_last, retention_max_age_days, last_scheduled_at, created_at, updated_at
 		FROM backup_targets
 		ORDER BY created_at DESC, id DESC
 	`)
@@ -291,7 +305,8 @@ func ListTargets(ctx context.Context, pool *pgxpool.Pool) ([]BackupTarget, error
 		if err := rows.Scan(
 			&out.ID, &out.Name, &out.TargetDSN, &out.StorageEndpoint, &out.StorageRegion, &out.StorageBucket,
 			&out.StorageAccessKey, &out.StorageSecretKey, &out.StorageForcePathStyle,
-			&out.SanityQuery, &out.ScheduleCron, &out.IntervalSeconds, &out.CreatedAt, &out.UpdatedAt,
+			&out.SanityQuery, &out.ScheduleCron, &out.IntervalSeconds,
+			&out.RetentionKeepLast, &out.RetentionMaxAgeDays, &out.LastScheduledAt, &out.CreatedAt, &out.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("db: scan backup target: %w", err)
 		}
@@ -305,6 +320,9 @@ func ListTargets(ctx context.Context, pool *pgxpool.Pool) ([]BackupTarget, error
 
 // UpdateTarget updates all mutable columns of an existing backup target.
 func UpdateTarget(ctx context.Context, pool *pgxpool.Pool, t BackupTarget) (*BackupTarget, error) {
+	if t.RetentionKeepLast < 0 || t.RetentionMaxAgeDays < 0 {
+		return nil, errors.New("db: retention policy values must be non-negative")
+	}
 	var out BackupTarget
 	err := pool.QueryRow(ctx, `
 		UPDATE backup_targets
@@ -319,19 +337,24 @@ func UpdateTarget(ctx context.Context, pool *pgxpool.Pool, t BackupTarget) (*Bac
 			sanity_query = $10,
 			schedule_cron = $11,
 			interval_seconds = $12,
+			retention_keep_last = $13,
+			retention_max_age_days = $14,
 			updated_at = NOW()
 		WHERE id = $1
 		RETURNING id, name, target_dsn, storage_endpoint, storage_region, storage_bucket,
 			storage_access_key, storage_secret_key, storage_force_path_style,
-			sanity_query, schedule_cron, interval_seconds, created_at, updated_at
+			sanity_query, schedule_cron, interval_seconds,
+			retention_keep_last, retention_max_age_days, last_scheduled_at, created_at, updated_at
 	`,
 		t.ID, t.Name, t.TargetDSN, t.StorageEndpoint, t.StorageRegion, t.StorageBucket,
 		t.StorageAccessKey, t.StorageSecretKey, t.StorageForcePathStyle,
 		t.SanityQuery, t.ScheduleCron, t.IntervalSeconds,
+		t.RetentionKeepLast, t.RetentionMaxAgeDays,
 	).Scan(
 		&out.ID, &out.Name, &out.TargetDSN, &out.StorageEndpoint, &out.StorageRegion, &out.StorageBucket,
 		&out.StorageAccessKey, &out.StorageSecretKey, &out.StorageForcePathStyle,
-		&out.SanityQuery, &out.ScheduleCron, &out.IntervalSeconds, &out.CreatedAt, &out.UpdatedAt,
+		&out.SanityQuery, &out.ScheduleCron, &out.IntervalSeconds,
+		&out.RetentionKeepLast, &out.RetentionMaxAgeDays, &out.LastScheduledAt, &out.CreatedAt, &out.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("db: update backup target %d: %w", t.ID, err)
@@ -369,7 +392,7 @@ func CreateArtifact(ctx context.Context, pool *pgxpool.Pool, a BackupArtifact) (
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		RETURNING id, job_id, target_id, object_key, wrapped_dek, plaintext_bytes,
 			ciphertext_bytes, ciphertext_sha256, pg_major_version, tables_json,
-			verification_passed, restore_duration_ms, verification_error, created_at
+			verification_passed, restore_duration_ms, verification_error, pruned_at, created_at
 	`,
 		a.JobID, a.TargetID, a.ObjectKey, a.WrappedDEK, a.PlaintextBytes,
 		a.CiphertextBytes, a.CiphertextSHA256, a.PGMajorVersion, tablesJSON,
@@ -377,7 +400,7 @@ func CreateArtifact(ctx context.Context, pool *pgxpool.Pool, a BackupArtifact) (
 	).Scan(
 		&out.ID, &out.JobID, &out.TargetID, &out.ObjectKey, &out.WrappedDEK, &out.PlaintextBytes,
 		&out.CiphertextBytes, &out.CiphertextSHA256, &out.PGMajorVersion, &rawTables,
-		&out.VerificationPassed, &out.RestoreDurationMs, &out.VerificationError, &out.CreatedAt,
+		&out.VerificationPassed, &out.RestoreDurationMs, &out.VerificationError, &out.PrunedAt, &out.CreatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("db: create backup artifact: %w", err)
@@ -406,6 +429,25 @@ func UpdateArtifactVerification(ctx context.Context, pool *pgxpool.Pool, artifac
 	return nil
 }
 
+// MarkArtifactPruned marks an artifact as pruned from object storage at prunedAt.
+func MarkArtifactPruned(ctx context.Context, pool *pgxpool.Pool, artifactID int64, prunedAt time.Time) error {
+	if prunedAt.IsZero() {
+		prunedAt = time.Now().UTC()
+	}
+	tag, err := pool.Exec(ctx, `
+		UPDATE backup_artifacts
+		SET pruned_at = $2
+		WHERE id = $1 AND pruned_at IS NULL
+	`, artifactID, prunedAt)
+	if err != nil {
+		return fmt.Errorf("db: mark artifact %d pruned: %w", artifactID, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("db: artifact %d not found or already pruned", artifactID)
+	}
+	return nil
+}
+
 // GetArtifactByJobID fetches the backup artifact produced by a specific job.
 func GetArtifactByJobID(ctx context.Context, pool *pgxpool.Pool, jobID int64) (*BackupArtifact, error) {
 	var out BackupArtifact
@@ -413,13 +455,13 @@ func GetArtifactByJobID(ctx context.Context, pool *pgxpool.Pool, jobID int64) (*
 	err := pool.QueryRow(ctx, `
 		SELECT id, job_id, target_id, object_key, wrapped_dek, plaintext_bytes,
 			ciphertext_bytes, ciphertext_sha256, pg_major_version, tables_json,
-			verification_passed, restore_duration_ms, verification_error, created_at
+			verification_passed, restore_duration_ms, verification_error, pruned_at, created_at
 		FROM backup_artifacts
 		WHERE job_id = $1
 	`, jobID).Scan(
 		&out.ID, &out.JobID, &out.TargetID, &out.ObjectKey, &out.WrappedDEK, &out.PlaintextBytes,
 		&out.CiphertextBytes, &out.CiphertextSHA256, &out.PGMajorVersion, &rawTables,
-		&out.VerificationPassed, &out.RestoreDurationMs, &out.VerificationError, &out.CreatedAt,
+		&out.VerificationPassed, &out.RestoreDurationMs, &out.VerificationError, &out.PrunedAt, &out.CreatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("db: get artifact for job %d: %w", jobID, err)
@@ -499,7 +541,7 @@ func ListArtifacts(ctx context.Context, pool *pgxpool.Pool, targetID *int64, lim
 		rows, err = pool.Query(ctx, `
 			SELECT id, job_id, target_id, object_key, wrapped_dek, plaintext_bytes,
 				ciphertext_bytes, ciphertext_sha256, pg_major_version, tables_json,
-				verification_passed, restore_duration_ms, verification_error, created_at
+				verification_passed, restore_duration_ms, verification_error, pruned_at, created_at
 			FROM backup_artifacts
 			WHERE target_id = $1
 			ORDER BY created_at DESC, id DESC
@@ -509,7 +551,7 @@ func ListArtifacts(ctx context.Context, pool *pgxpool.Pool, targetID *int64, lim
 		rows, err = pool.Query(ctx, `
 			SELECT id, job_id, target_id, object_key, wrapped_dek, plaintext_bytes,
 				ciphertext_bytes, ciphertext_sha256, pg_major_version, tables_json,
-				verification_passed, restore_duration_ms, verification_error, created_at
+				verification_passed, restore_duration_ms, verification_error, pruned_at, created_at
 			FROM backup_artifacts
 			ORDER BY created_at DESC, id DESC
 			LIMIT $1
@@ -527,7 +569,7 @@ func ListArtifacts(ctx context.Context, pool *pgxpool.Pool, targetID *int64, lim
 		if err := rows.Scan(
 			&out.ID, &out.JobID, &out.TargetID, &out.ObjectKey, &out.WrappedDEK, &out.PlaintextBytes,
 			&out.CiphertextBytes, &out.CiphertextSHA256, &out.PGMajorVersion, &rawTables,
-			&out.VerificationPassed, &out.RestoreDurationMs, &out.VerificationError, &out.CreatedAt,
+			&out.VerificationPassed, &out.RestoreDurationMs, &out.VerificationError, &out.PrunedAt, &out.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("db: scan artifact: %w", err)
 		}

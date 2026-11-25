@@ -86,3 +86,60 @@ func TestDecideFailureDisposition(t *testing.T) {
 		})
 	}
 }
+
+func TestIsTargetDue(t *testing.T) {
+	now := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	tenMinAgo := now.Add(-10 * time.Minute)
+	fiveMinAgo := now.Add(-5 * time.Minute)
+
+	cases := []struct {
+		name            string
+		lastScheduledAt *time.Time
+		intervalSeconds int
+		want            bool
+	}{
+		{"never_scheduled_positive_interval", nil, 600, true},
+		{"never_scheduled_zero_interval", nil, 0, false},
+		{"never_scheduled_negative_interval", nil, -60, false},
+		{"exact_interval_elapsed", &tenMinAgo, 600, true},
+		{"past_interval_elapsed", &tenMinAgo, 300, true},
+		{"not_due_yet", &fiveMinAgo, 600, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsTargetDue(tc.lastScheduledAt, tc.intervalSeconds, now); got != tc.want {
+				t.Errorf("IsTargetDue() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDecideStaleRecovery(t *testing.T) {
+	status, msg := DecideStaleRecovery(1, 3)
+	if status != StatusQueued {
+		t.Errorf("DecideStaleRecovery(1, 3) status = %q, want %q", status, StatusQueued)
+	}
+	if msg != StaleJobRecoveredError {
+		t.Errorf("DecideStaleRecovery(1, 3) msg = %q, want %q", msg, StaleJobRecoveredError)
+	}
+
+	status, msg = DecideStaleRecovery(3, 3)
+	if status != StatusFailed {
+		t.Errorf("DecideStaleRecovery(3, 3) status = %q, want %q", status, StatusFailed)
+	}
+	if msg != StaleJobMaxAttemptsError {
+		t.Errorf("DecideStaleRecovery(3, 3) msg = %q, want %q", msg, StaleJobMaxAttemptsError)
+	}
+}
+
+func TestComputeLeaseExpiry(t *testing.T) {
+	now := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+
+	if got := ComputeLeaseExpiry(now, 0); !got.Equal(now.Add(DefaultJobLeaseDuration)) {
+		t.Errorf("ComputeLeaseExpiry(default) = %v, want %v", got, now.Add(DefaultJobLeaseDuration))
+	}
+	if got := ComputeLeaseExpiry(now, 5*time.Minute); !got.Equal(now.Add(5 * time.Minute)) {
+		t.Errorf("ComputeLeaseExpiry(5m) = %v, want %v", got, now.Add(5*time.Minute))
+	}
+}

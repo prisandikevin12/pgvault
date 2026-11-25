@@ -65,6 +65,8 @@ export default function DashboardPage() {
   const [storageSecretKey, setStorageSecretKey] = useState("");
   const [forcePathStyle, setForcePathStyle] = useState(false);
   const [intervalSeconds, setIntervalSeconds] = useState(86400);
+  const [retentionKeepLast, setRetentionKeepLast] = useState(7);
+  const [retentionMaxAgeDays, setRetentionMaxAgeDays] = useState(30);
   const [sanityQuery, setSanityQuery] = useState("");
   const [submittingTarget, setSubmittingTarget] = useState(false);
 
@@ -177,6 +179,8 @@ export default function DashboardPage() {
         storage_force_path_style: forcePathStyle,
         sanity_query: sanityQuery,
         interval_seconds: Number(intervalSeconds) || 86400,
+        retention_keep_last: Math.max(0, Number(retentionKeepLast) || 0),
+        retention_max_age_days: Math.max(0, Number(retentionMaxAgeDays) || 0),
       });
       setSuccessMsg(`Created target "${created.name}" (#${created.id}). Credentials encrypted at rest.`);
       setTargetName("");
@@ -404,7 +408,13 @@ export default function DashboardPage() {
                         <td className="mono">
                           {t.sanity_query || <span style={{ color: "var(--muted)" }}>None</span>}
                         </td>
-                        <td>Every {t.interval_seconds}s</td>
+                        <td>
+                          <div>Every {t.interval_seconds}s</div>
+                          <div className="mono" style={{ color: "var(--muted)" }}>
+                            Keep: {t.retention_keep_last > 0 ? t.retention_keep_last : "∞"} · MaxAge:{" "}
+                            {t.retention_max_age_days > 0 ? `${t.retention_max_age_days}d` : "∞"}
+                          </div>
+                        </td>
                         <td>
                           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                             <span className="badge badge-success">
@@ -526,6 +536,26 @@ export default function DashboardPage() {
                   min={60}
                   value={intervalSeconds}
                   onChange={(e) => setIntervalSeconds(Number(e.target.value))}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="retention-keep-last">Retention: Keep Last (0 = off)</label>
+                <input
+                  id="retention-keep-last"
+                  type="number"
+                  min={0}
+                  value={retentionKeepLast}
+                  onChange={(e) => setRetentionKeepLast(Number(e.target.value))}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="retention-max-age-days">Retention: Max Age Days (0 = off)</label>
+                <input
+                  id="retention-max-age-days"
+                  type="number"
+                  min={0}
+                  value={retentionMaxAgeDays}
+                  onChange={(e) => setRetentionMaxAgeDays(Number(e.target.value))}
                 />
               </div>
               <div className="field full">
@@ -666,18 +696,26 @@ export default function DashboardPage() {
                         </td>
                         <td className="mono">{a.tables.length}</td>
                         <td>
-                          {a.verification_passed ? (
-                            <span className="badge badge-success">
-                              Passed · {a.restore_duration_ms} ms
-                            </span>
-                          ) : (
-                            <div>
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                            {a.verification_passed ? (
+                              <span className="badge badge-success">
+                                Passed · {a.restore_duration_ms} ms
+                              </span>
+                            ) : (
                               <span className="badge badge-danger">Failed</span>
-                              {a.verification_error && (
-                                <div style={{ color: "#fca5a5", marginTop: 4, fontSize: "0.78rem" }}>
-                                  {a.verification_error}
-                                </div>
-                              )}
+                            )}
+                            {a.pruned_at && (
+                              <span
+                                className="badge badge-muted"
+                                title={`Pruned at ${new Date(a.pruned_at).toLocaleString()}`}
+                              >
+                                Pruned
+                              </span>
+                            )}
+                          </div>
+                          {!a.verification_passed && a.verification_error && (
+                            <div style={{ color: "#fca5a5", marginTop: 4, fontSize: "0.78rem" }}>
+                              {a.verification_error}
                             </div>
                           )}
                         </td>

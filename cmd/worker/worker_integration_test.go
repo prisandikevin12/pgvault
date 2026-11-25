@@ -221,3 +221,88 @@ func TestWorker_Integration_EndToEndBackupAndVerify(t *testing.T) {
 		t.Errorf("SECURITY VIOLATION: notification message leaked DB password: %q", formatted)
 	}
 }
+
+func TestWorker_Integration_MaintenanceSchedulerAndRecovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	appDSN := testEnvOrDefault("PGVAULT_TEST_APP_DSN", "postgres://pgvault:pgvault_dev_password@127.0.0.1:5432/pgvault?sslmode=disable")
+	pool, err := db.ConnectPool(ctx, appDSN)
+	if err != nil {
+		t.Fatalf("ConnectPool() error: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	if err := db.ApplyMigrations(ctx, pool); err != nil {
+		t.Fatalf("ApplyMigrations() error: %v", err)
+	}
+
+	kek, _ := crypto.GenerateDEK()
+	targetName := fmt.Sprintf("worker-maint-%d", time.Now().UnixNano())
+	target, err := db.CreateTarget(ctx, pool, db.BackupTarget{
+		Name:            targetName,
+		TargetDSN:       "postgres://example",
+		StorageRegion:   "us-east-1",
+		StorageBucket:   "pgvault-test",
+		IntervalSeconds: 300,
+	})
+	if err != nil {
+		t.Fatalf("CreateTarget() error: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanCancel()
+		_, _ = pool.Exec(cleanCtx, "DELETE FROM backup_targets WHERE id = $1", target.ID)
+	})
+
+	worker, err := NewWorker(pool, WorkerConfig{
+		WorkerID:          "maint-worker",
+		KEK:               kek,
+		SchedulerInterval: 10 * time.Second,
+		JobLeaseDuration:  5 * time.Minute,
+	}, &recordingNotifier{}, nil)
+	if err != nil {
+		t.Fatalf("NewWorker() error: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+
+	// 1. RunMaintenanceOnce schedules the due target (last_scheduled_at is NULL).
+	recovered, scheduled, err := worker.RunMaintenanceOnce(ctx, now)
+	if err != nil {
+		t.Fatalf("RunMaintenanceOnce(1) error: %v", err)
+	}
+	if scheduled < 1 {
+		t.Fatalf("RunMaintenanceOnce(1) scheduled = %d, want >= 1 (recovered=%d)", scheduled, recovered)
+	}
+
+	jobs, err := queue.ListJobs(ctx, pool, &target.ID, queue.StatusQueued, 5)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("ListJobs() = %+v, %v; want 1 scheduled job", jobs, err)
+	}
+
+	// 2. Simulate crashed worker with expired lease on that job, then verify RunMaintenanceOnce recovers it.
+	if _, err := pool.Exec(ctx, `
+		UPDATE backup_jobs
+		SET status = 'running', attempts = 1, locked_at = $2, locked_by = 'crashed-worker', lease_expires_at = $3
+		WHERE id = $1
+	`, jobs[0].ID, now.Add(-10*time.Minute), now.Add(-5*time.Minute)); err != nil {
+		t.Fatalf("simulate expired lease error: %v", err)
+	}
+
+	recovered, _, err = worker.RunMaintenanceOnce(ctx, now)
+	if err != nil {
+		t.Fatalf("RunMaintenanceOnce(2) error: %v", err)
+	}
+	if recovered < 1 {
+		t.Fatalf("RunMaintenanceOnce(2) recovered = %d, want >= 1", recovered)
+	}
+
+	got, err := queue.GetJob(ctx, pool, jobs[0].ID)
+	if err != nil {
+		t.Fatalf("GetJob() error: %v", err)
+	}
+	if got.Status != queue.StatusQueued || got.LeaseExpiresAt != nil || got.ErrorMessage != queue.StaleJobRecoveredError {
+		t.Fatalf("unexpected job state after worker maintenance recovery: %+v", got)
+	}
+}

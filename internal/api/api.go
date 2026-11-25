@@ -190,6 +190,8 @@ type CreateTargetRequest struct {
 	SanityQuery           string `json:"sanity_query"`
 	ScheduleCron          string `json:"schedule_cron"`
 	IntervalSeconds       int    `json:"interval_seconds"`
+	RetentionKeepLast     int    `json:"retention_keep_last"`
+	RetentionMaxAgeDays   int    `json:"retention_max_age_days"`
 }
 
 // Validate checks CreateTargetRequest fields and sanity query safety.
@@ -212,6 +214,12 @@ func (r CreateTargetRequest) Validate() error {
 	if r.IntervalSeconds < 0 {
 		return errors.New("interval_seconds must be non-negative")
 	}
+	if r.RetentionKeepLast < 0 {
+		return errors.New("retention_keep_last must be non-negative")
+	}
+	if r.RetentionMaxAgeDays < 0 {
+		return errors.New("retention_max_age_days must be non-negative")
+	}
 	if err := verifier.ValidateSanityQuery(r.SanityQuery); err != nil {
 		return err
 	}
@@ -230,6 +238,8 @@ type UpdateTargetRequest struct {
 	SanityQuery           *string `json:"sanity_query"`
 	ScheduleCron          *string `json:"schedule_cron"`
 	IntervalSeconds       *int    `json:"interval_seconds"`
+	RetentionKeepLast     *int    `json:"retention_keep_last"`
+	RetentionMaxAgeDays   *int    `json:"retention_max_age_days"`
 }
 
 type TriggerBackupRequest struct {
@@ -255,11 +265,14 @@ type TargetResponse struct {
 	StorageAccessKey      string    `json:"storage_access_key"`
 	HasStorageSecretKey   bool      `json:"has_storage_secret_key"`
 	StorageForcePathStyle bool      `json:"storage_force_path_style"`
-	SanityQuery           string    `json:"sanity_query"`
-	ScheduleCron          string    `json:"schedule_cron"`
-	IntervalSeconds       int       `json:"interval_seconds"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	SanityQuery           string     `json:"sanity_query"`
+	ScheduleCron          string     `json:"schedule_cron"`
+	IntervalSeconds       int        `json:"interval_seconds"`
+	RetentionKeepLast     int        `json:"retention_keep_last"`
+	RetentionMaxAgeDays   int        `json:"retention_max_age_days"`
+	LastScheduledAt       *time.Time `json:"last_scheduled_at,omitempty"`
+	CreatedAt             time.Time  `json:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at"`
 }
 
 type ArtifactResponse struct {
@@ -275,6 +288,7 @@ type ArtifactResponse struct {
 	VerificationPassed bool                   `json:"verification_passed"`
 	RestoreDurationMs  int64                  `json:"restore_duration_ms"`
 	VerificationError  string                 `json:"verification_error"`
+	PrunedAt           *time.Time             `json:"pruned_at,omitempty"`
 	CreatedAt          time.Time              `json:"created_at"`
 }
 
@@ -321,6 +335,9 @@ func toTargetResponse(t db.BackupTarget) TargetResponse {
 		SanityQuery:           t.SanityQuery,
 		ScheduleCron:          t.ScheduleCron,
 		IntervalSeconds:       t.IntervalSeconds,
+		RetentionKeepLast:     t.RetentionKeepLast,
+		RetentionMaxAgeDays:   t.RetentionMaxAgeDays,
+		LastScheduledAt:       t.LastScheduledAt,
 		CreatedAt:             t.CreatedAt,
 		UpdatedAt:             t.UpdatedAt,
 	}
@@ -344,6 +361,7 @@ func toArtifactResponse(a db.BackupArtifact) ArtifactResponse {
 		VerificationPassed: a.VerificationPassed,
 		RestoreDurationMs:  a.RestoreDurationMs,
 		VerificationError:  a.VerificationError,
+		PrunedAt:           a.PrunedAt,
 		CreatedAt:          a.CreatedAt,
 	}
 }
@@ -451,6 +469,8 @@ func (s *Server) handleCreateTarget(w http.ResponseWriter, r *http.Request) {
 		SanityQuery:           strings.TrimSpace(req.SanityQuery),
 		ScheduleCron:          strings.TrimSpace(req.ScheduleCron),
 		IntervalSeconds:       interval,
+		RetentionKeepLast:     req.RetentionKeepLast,
+		RetentionMaxAgeDays:   req.RetentionMaxAgeDays,
 	})
 	if err != nil {
 		if isPGCode(err, "23505") {
@@ -582,6 +602,20 @@ func (s *Server) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		existing.IntervalSeconds = *req.IntervalSeconds
+	}
+	if req.RetentionKeepLast != nil {
+		if *req.RetentionKeepLast < 0 {
+			writeJSONError(w, http.StatusBadRequest, "retention_keep_last must be non-negative")
+			return
+		}
+		existing.RetentionKeepLast = *req.RetentionKeepLast
+	}
+	if req.RetentionMaxAgeDays != nil {
+		if *req.RetentionMaxAgeDays < 0 {
+			writeJSONError(w, http.StatusBadRequest, "retention_max_age_days must be non-negative")
+			return
+		}
+		existing.RetentionMaxAgeDays = *req.RetentionMaxAgeDays
 	}
 
 	updated, err := db.UpdateTarget(r.Context(), s.pool, *existing)

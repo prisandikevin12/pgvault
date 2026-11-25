@@ -21,20 +21,25 @@ import (
 )
 
 const (
-	defaultPollInterval  = 2 * time.Second
-	defaultVerifyTimeout = 5 * time.Minute
-	defaultBaseBackoff   = 15 * time.Second
-	defaultMaxBackoff    = 15 * time.Minute
+	defaultPollInterval      = 2 * time.Second
+	defaultSchedulerInterval = 15 * time.Second
+	defaultJobLeaseDuration  = queue.DefaultJobLeaseDuration
+	defaultVerifyTimeout     = 5 * time.Minute
+	defaultBaseBackoff       = 15 * time.Second
+	defaultMaxBackoff        = 15 * time.Minute
 )
 
 // WorkerConfig configures the backup/verification worker runner.
 type WorkerConfig struct {
-	WorkerID      string
-	PollInterval  time.Duration
-	KEK           []byte
-	VerifyTimeout time.Duration
-	BaseBackoff   time.Duration
-	MaxBackoff    time.Duration
+	WorkerID          string
+	PollInterval      time.Duration
+	SchedulerInterval time.Duration
+	PruneInterval     time.Duration
+	JobLeaseDuration  time.Duration
+	KEK               []byte
+	VerifyTimeout     time.Duration
+	BaseBackoff       time.Duration
+	MaxBackoff        time.Duration
 }
 
 // Validate checks required worker settings.
@@ -44,6 +49,15 @@ func (c WorkerConfig) Validate() error {
 	}
 	if c.PollInterval < 0 {
 		return errors.New("worker: poll interval must be non-negative")
+	}
+	if c.SchedulerInterval < 0 {
+		return errors.New("worker: scheduler interval must be non-negative")
+	}
+	if c.PruneInterval < 0 {
+		return errors.New("worker: prune interval must be non-negative")
+	}
+	if c.JobLeaseDuration < 0 {
+		return errors.New("worker: job lease duration must be non-negative")
 	}
 	if c.VerifyTimeout < 0 {
 		return errors.New("worker: verify timeout must be non-negative")
@@ -78,6 +92,15 @@ func NewWorker(pool *pgxpool.Pool, cfg WorkerConfig, notifier notify.Notifier, l
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = defaultPollInterval
 	}
+	if cfg.SchedulerInterval == 0 {
+		cfg.SchedulerInterval = defaultSchedulerInterval
+	}
+	if cfg.PruneInterval == 0 {
+		cfg.PruneInterval = cfg.SchedulerInterval
+	}
+	if cfg.JobLeaseDuration == 0 {
+		cfg.JobLeaseDuration = defaultJobLeaseDuration
+	}
 	if cfg.VerifyTimeout == 0 {
 		cfg.VerifyTimeout = defaultVerifyTimeout
 	}
@@ -99,14 +122,102 @@ func NewWorker(pool *pgxpool.Pool, cfg WorkerConfig, notifier notify.Notifier, l
 	}, nil
 }
 
-// Run polls the job queue continuously until ctx is canceled.
+// RunMaintenanceOnce executes one stale-job recovery and auto-scheduler sweep.
+func (w *Worker) RunMaintenanceOnce(ctx context.Context, now time.Time) (recovered int, scheduled int, err error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	recovered, err = queue.RecoverStaleJobs(ctx, w.pool, now)
+	if err != nil {
+		return 0, 0, err
+	}
+	if recovered > 0 {
+		w.logger.Warn("recovered stale backup jobs", "worker_id", w.cfg.WorkerID, "count", recovered)
+	}
+
+	scheduled, err = queue.EnqueueDueScheduledTargets(ctx, w.pool, now)
+	if err != nil {
+		return recovered, 0, err
+	}
+	if scheduled > 0 {
+		w.logger.Info("enqueued scheduled backup jobs", "worker_id", w.cfg.WorkerID, "count", scheduled)
+	}
+	return recovered, scheduled, nil
+}
+
+// RunPruneOnce evaluates retention policies across all targets and deletes expired S3 objects.
+func (w *Worker) RunPruneOnce(ctx context.Context, now time.Time) (queue.PruneSummary, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	summary, err := queue.PruneExpiredBackups(ctx, w.pool, now, func(delCtx context.Context, target db.BackupTarget) (queue.ObjectDeleter, error) {
+		secretKey, decErr := db.UnprotectSecret(w.cfg.KEK, target.StorageSecretKey)
+		if decErr != nil {
+			return nil, fmt.Errorf("unprotect storage secret: %w", decErr)
+		}
+		return storage.NewClient(delCtx, storage.Config{
+			EndpointURL:     target.StorageEndpoint,
+			Region:          target.StorageRegion,
+			Bucket:          target.StorageBucket,
+			AccessKeyID:     target.StorageAccessKey,
+			SecretAccessKey: secretKey,
+			ForcePathStyle:  target.StorageForcePathStyle,
+		})
+	})
+	if summary.ObjectsPruned > 0 {
+		w.logger.Info("pruned expired backup objects",
+			"worker_id", w.cfg.WorkerID,
+			"targets_evaluated", summary.TargetsEvaluated,
+			"objects_pruned", summary.ObjectsPruned,
+			"errors", summary.Errors,
+		)
+	}
+	return summary, err
+}
+
+// Run polls the job queue continuously until ctx is canceled, periodically recovering
+// stale leases, enqueuing due scheduled backup targets, and pruning expired backups.
 func (w *Worker) Run(ctx context.Context) error {
-	w.logger.Info("pgvault worker started", "worker_id", w.cfg.WorkerID, "poll_interval", w.cfg.PollInterval)
+	w.logger.Info("pgvault worker started",
+		"worker_id", w.cfg.WorkerID,
+		"poll_interval", w.cfg.PollInterval,
+		"scheduler_interval", w.cfg.SchedulerInterval,
+		"prune_interval", w.cfg.PruneInterval,
+		"job_lease_duration", w.cfg.JobLeaseDuration,
+	)
 	defer w.logger.Info("pgvault worker stopped", "worker_id", w.cfg.WorkerID)
+
+	var (
+		lastMaintenance time.Time
+		lastPrune       time.Time
+	)
 
 	for {
 		if ctx.Err() != nil {
 			return nil
+		}
+
+		now := time.Now().UTC()
+		if lastMaintenance.IsZero() || now.Sub(lastMaintenance) >= w.cfg.SchedulerInterval {
+			if _, _, err := w.RunMaintenanceOnce(ctx, now); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				w.logger.Error("worker maintenance sweep failed", "worker_id", w.cfg.WorkerID, "error", notify.SanitizeMessage(err.Error()))
+			}
+			lastMaintenance = now
+		}
+
+		if lastPrune.IsZero() || now.Sub(lastPrune) >= w.cfg.PruneInterval {
+			if _, err := w.RunPruneOnce(ctx, now); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				w.logger.Error("worker retention prune failed", "worker_id", w.cfg.WorkerID, "error", notify.SanitizeMessage(err.Error()))
+			}
+			lastPrune = now
 		}
 
 		processed, err := w.ProcessOnce(ctx)
@@ -130,10 +241,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 }
 
-// ProcessOnce attempts to claim and execute a single queued job.
+// ProcessOnce attempts to claim and execute a single queued job with a lease.
 // Returns processed=false if no eligible job was available.
 func (w *Worker) ProcessOnce(ctx context.Context) (bool, error) {
-	job, err := queue.ClaimNextJob(ctx, w.pool, w.cfg.WorkerID)
+	job, err := queue.ClaimNextJobWithLease(ctx, w.pool, w.cfg.WorkerID, time.Now().UTC(), w.cfg.JobLeaseDuration)
 	if err != nil {
 		return false, err
 	}

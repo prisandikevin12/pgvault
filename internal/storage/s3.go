@@ -209,6 +209,7 @@ func (c *Client) DownloadStream(ctx context.Context, key string) (io.ReadCloser,
 }
 
 // DeleteObject removes the specified object from the configured S3 bucket.
+// Missing objects (NoSuchKey / HTTP 404) are treated as idempotent success.
 func (c *Client) DeleteObject(ctx context.Context, key string) error {
 	if strings.TrimSpace(key) == "" {
 		return errors.New("storage: object key is required")
@@ -218,12 +219,79 @@ func (c *Client) DeleteObject(ctx context.Context, key string) error {
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
 	}); err != nil {
+		if IsNotFoundError(err) {
+			return nil
+		}
 		return fmt.Errorf("storage: delete %q: %w", key, err)
 	}
 	return nil
 }
 
+// DeleteObjects removes multiple objects in batches (up to 1000 keys per request).
+// Missing objects (NoSuchKey / NotFound) are ignored cleanly.
+func (c *Client) DeleteObjects(ctx context.Context, keys []string) error {
+	seen := make(map[string]struct{}, len(keys))
+	clean := make([]types.ObjectIdentifier, 0, len(keys))
+	for _, k := range keys {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		clean = append(clean, types.ObjectIdentifier{Key: aws.String(k)})
+	}
+	if len(clean) == 0 {
+		return nil
+	}
+
+	const maxBatchSize = 1000
+	for start := 0; start < len(clean); start += maxBatchSize {
+		end := start + maxBatchSize
+		if end > len(clean) {
+			end = len(clean)
+		}
+
+		out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(c.bucket),
+			Delete: &types.Delete{
+				Objects: clean[start:end],
+				Quiet:   aws.Bool(true),
+			},
+		})
+		if err != nil {
+			if IsNotFoundError(err) {
+				continue
+			}
+			return fmt.Errorf("storage: batch delete objects: %w", err)
+		}
+
+		var batchErrs []error
+		for _, delErr := range out.Errors {
+			code := aws.ToString(delErr.Code)
+			if code == "NoSuchKey" || code == "NotFound" {
+				continue
+			}
+			batchErrs = append(batchErrs, fmt.Errorf("key %q (%s): %s", aws.ToString(delErr.Key), code, aws.ToString(delErr.Message)))
+		}
+		if len(batchErrs) > 0 {
+			return fmt.Errorf("storage: batch delete failed: %w", errors.Join(batchErrs...))
+		}
+	}
+	return nil
+}
+
+// IsNotFoundError reports whether err represents an S3/R2/LocalStack not-found condition (404, NotFound, NoSuchKey, NoSuchBucket).
+func IsNotFoundError(err error) bool {
+	return isNotFoundError(err)
+}
+
 func isNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
 	var respErr *smithyhttp.ResponseError
 	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusNotFound {
 		return true
@@ -231,7 +299,7 @@ func isNotFoundError(err error) bool {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
-		case "NotFound", "NoSuchBucket", "404":
+		case "NotFound", "NoSuchBucket", "NoSuchKey", "404":
 			return true
 		}
 	}
