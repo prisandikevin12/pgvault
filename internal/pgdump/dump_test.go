@@ -311,3 +311,71 @@ func TestStreamingPipeline_UploadErrorStopsDumpWithoutDeadlock(t *testing.T) {
 		t.Errorf("error = %v, want wrapped %v", err, uploadErr)
 	}
 }
+
+func TestSplitDSNPassword(t *testing.T) {
+	cases := []struct {
+		name         string
+		dsn          string
+		wantPassword string
+		mustContain  []string
+		mustNotHave  []string
+	}{
+		{
+			name:         "uri_with_password_and_sslmode",
+			dsn:          "postgres://backup_user:SuperSecret123@db.prod.example.com:5432/appdb?sslmode=require&connect_timeout=5",
+			wantPassword: "SuperSecret123",
+			mustContain:  []string{"postgres://backup_user@db.prod.example.com:5432/appdb", "sslmode=require", "connect_timeout=5"},
+			mustNotHave:  []string{"SuperSecret123"},
+		},
+		{
+			name:         "uri_without_password",
+			dsn:          "postgresql://readonly@10.0.1.5:5432/mydb?sslmode=disable",
+			wantPassword: "",
+			mustContain:  []string{"postgresql://readonly@10.0.1.5:5432/mydb", "sslmode=disable"},
+		},
+		{
+			name:         "kv_unquoted_password",
+			dsn:          "host=db.internal port=5432 user=pgvault password=kvSecretPass dbname=prod sslmode=verify-full",
+			wantPassword: "kvSecretPass",
+			mustContain:  []string{"host=db.internal", "port=5432", "user=pgvault", "dbname=prod", "sslmode=verify-full"},
+			mustNotHave:  []string{"kvSecretPass", "password="},
+		},
+		{
+			name:         "kv_quoted_password_with_spaces",
+			dsn:          "host=db.internal user=pgvault password='my secret pass' dbname=prod sslmode=require",
+			wantPassword: "my secret pass",
+			mustContain:  []string{"host=db.internal", "user=pgvault", "dbname=prod", "sslmode=require"},
+			mustNotHave:  []string{"my secret pass", "password="},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			safeDSN, pw, err := splitDSNPassword(tc.dsn)
+			if err != nil {
+				t.Fatalf("splitDSNPassword() unexpected error: %v", err)
+			}
+			if pw != tc.wantPassword {
+				t.Errorf("password = %q, want %q", pw, tc.wantPassword)
+			}
+			for _, sub := range tc.mustContain {
+				if !strings.Contains(safeDSN, sub) {
+					t.Errorf("safeDSN %q missing %q", safeDSN, sub)
+				}
+			}
+			for _, forbidden := range tc.mustNotHave {
+				if strings.Contains(safeDSN, forbidden) {
+					t.Errorf("safeDSN %q leaked forbidden substring %q", safeDSN, forbidden)
+				}
+			}
+		})
+	}
+}
+
+func TestSanitizePGDumpError_RedactsSecrets(t *testing.T) {
+	raw := "pg_dump: error: connection to server at postgres://admin:TopSecret99@db.local:5432/prod failed (password=TopSecret99)"
+	cleaned := sanitizePGDumpError(raw, "TopSecret99")
+	if strings.Contains(cleaned, "TopSecret99") {
+		t.Fatalf("sanitizePGDumpError leaked password: %q", cleaned)
+	}
+}

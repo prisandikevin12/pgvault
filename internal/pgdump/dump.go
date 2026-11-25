@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/prisandikevin12/pgvault/internal/crypto"
+	"github.com/prisandikevin12/pgvault/internal/notify"
 	"github.com/prisandikevin12/pgvault/internal/storage"
 	"golang.org/x/sync/errgroup"
 )
@@ -214,6 +217,11 @@ func RunEncryptedBackup(ctx context.Context, req BackupRequest) (*BackupResult, 
 }
 
 func runPGDump(ctx context.Context, dsn string, stdout io.Writer) error {
+	safeDSN, password, err := splitDSNPassword(dsn)
+	if err != nil {
+		return fmt.Errorf("pgdump: parse target DSN: %w", err)
+	}
+
 	stderrBuf := newTailBuffer(stderrTailLimit)
 	cmd := exec.CommandContext(
 		ctx,
@@ -221,19 +229,141 @@ func runPGDump(ctx context.Context, dsn string, stdout io.Writer) error {
 		"--format=custom",
 		"--no-owner",
 		"--no-privileges",
-		"--dbname="+dsn,
+		"--dbname="+safeDSN,
 	)
+	cmd.Env = buildPGDumpEnv(os.Environ(), password)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderrBuf
 
 	if err := cmd.Run(); err != nil {
-		stderrMsg := strings.TrimSpace(stderrBuf.String())
+		stderrMsg := sanitizePGDumpError(strings.TrimSpace(stderrBuf.String()), password)
 		if stderrMsg != "" {
 			return fmt.Errorf("pgdump: pg_dump failed: %w: %s", err, stderrMsg)
 		}
 		return fmt.Errorf("pgdump: pg_dump failed: %w", err)
 	}
 	return nil
+}
+
+// splitDSNPassword removes any password from a PostgreSQL URI or libpq keyword-value
+// connection string and returns the password separately so it can be supplied via PGPASSWORD
+// instead of appearing in process argv (/proc/<pid>/cmdline).
+func splitDSNPassword(dsn string) (string, string, error) {
+	trimmed := strings.TrimSpace(dsn)
+	if trimmed == "" {
+		return "", "", errors.New("empty DSN")
+	}
+
+	if strings.HasPrefix(trimmed, "postgres://") || strings.HasPrefix(trimmed, "postgresql://") {
+		u, err := url.Parse(trimmed)
+		if err != nil {
+			return "", "", errors.New("invalid PostgreSQL URI")
+		}
+		var password string
+		if u.User != nil {
+			if pw, hasPw := u.User.Password(); hasPw {
+				password = pw
+				u.User = url.User(u.User.Username())
+			}
+		}
+		return u.String(), password, nil
+	}
+
+	safeKV, password, err := extractAndStripKeywordValuePassword(trimmed)
+	if err != nil {
+		return "", "", err
+	}
+	return safeKV, password, nil
+}
+
+// extractAndStripKeywordValuePassword extracts the password (if any) and removes password=...
+// tokens from a libpq keyword/value string while preserving all other options (sslmode,
+// sslrootcert, host, port, user, dbname, etc.) without reading local filesystem cert files.
+func extractAndStripKeywordValuePassword(kv string) (string, string, error) {
+	var (
+		parts    []string
+		password string
+	)
+	i := 0
+	n := len(kv)
+	for i < n {
+		for i < n && (kv[i] == ' ' || kv[i] == '\t' || kv[i] == '\n' || kv[i] == '\r') {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		start := i
+		for i < n && kv[i] != '=' && kv[i] != ' ' && kv[i] != '\t' {
+			i++
+		}
+		key := strings.ToLower(kv[start:i])
+		for i < n && (kv[i] == ' ' || kv[i] == '\t') {
+			i++
+		}
+		if i >= n || kv[i] != '=' {
+			return "", "", errors.New("invalid PostgreSQL connection string")
+		}
+		i++
+		for i < n && (kv[i] == ' ' || kv[i] == '\t') {
+			i++
+		}
+		var valBuf strings.Builder
+		if i < n && kv[i] == '\'' {
+			i++
+			closed := false
+			for i < n {
+				if kv[i] == '\\' && i+1 < n {
+					valBuf.WriteByte(kv[i+1])
+					i += 2
+					continue
+				}
+				if kv[i] == '\'' {
+					i++
+					closed = true
+					break
+				}
+				valBuf.WriteByte(kv[i])
+				i++
+			}
+			if !closed {
+				return "", "", errors.New("unterminated quote in PostgreSQL connection string")
+			}
+		} else {
+			for i < n && kv[i] != ' ' && kv[i] != '\t' && kv[i] != '\n' && kv[i] != '\r' {
+				valBuf.WriteByte(kv[i])
+				i++
+			}
+		}
+		token := kv[start:i]
+		if key == "password" {
+			password = valBuf.String()
+		} else {
+			parts = append(parts, token)
+		}
+	}
+	return strings.Join(parts, " "), password, nil
+}
+
+func buildPGDumpEnv(baseEnv []string, password string) []string {
+	env := make([]string, 0, len(baseEnv)+1)
+	for _, kv := range baseEnv {
+		if strings.HasPrefix(kv, "PGPASSWORD=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	if password != "" {
+		env = append(env, "PGPASSWORD="+password)
+	}
+	return env
+}
+
+func sanitizePGDumpError(msg, password string) string {
+	if password != "" {
+		msg = strings.ReplaceAll(msg, password, "[REDACTED]")
+	}
+	return notify.SanitizeMessage(msg)
 }
 
 // streamDumpEncryptUpload coordinates the 3-stage streaming pipeline:

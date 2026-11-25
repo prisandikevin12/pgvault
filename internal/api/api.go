@@ -245,6 +245,9 @@ func (r CreateTargetRequest) Validate() error {
 	if strings.TrimSpace(r.TargetDSN) == "" {
 		return errors.New("target_dsn is required")
 	}
+	if err := validateTargetDSN(r.TargetDSN); err != nil {
+		return err
+	}
 	if strings.TrimSpace(r.StorageRegion) == "" {
 		return errors.New("storage_region is required")
 	}
@@ -602,7 +605,12 @@ func (s *Server) handleUpdateTarget(w http.ResponseWriter, r *http.Request) {
 		existing.Name = name
 	}
 	if req.TargetDSN != nil && strings.TrimSpace(*req.TargetDSN) != "" {
-		enc, err := db.ProtectSecret(s.kek, strings.TrimSpace(*req.TargetDSN))
+		dsnTrimmed := strings.TrimSpace(*req.TargetDSN)
+		if err := validateTargetDSN(dsnTrimmed); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		enc, err := db.ProtectSecret(s.kek, dsnTrimmed)
 		if err != nil {
 			s.internalError(w, "encrypt updated target DSN", err)
 			return
@@ -1029,6 +1037,8 @@ func (s *Server) serveArtifactStream(w http.ResponseWriter, r *http.Request, dec
 	filename := fmt.Sprintf("pgvault-artifact-%d.%s", artifact.ID, ext)
 
 	commitHeaders := func() {
+		// Clear http.Server's global WriteTimeout for large streaming artifact responses.
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 		w.Header().Set("Cache-Control", "no-store")
@@ -1248,6 +1258,34 @@ func parseQueryInt(r *http.Request, key string, fallback int) (int, error) {
 		return 0, fmt.Errorf("invalid %s query parameter", key)
 	}
 	return v, nil
+}
+
+func validateTargetDSN(dsn string) error {
+	trimmed := strings.TrimSpace(dsn)
+	if trimmed == "" {
+		return errors.New("target_dsn is required")
+	}
+	if strings.HasPrefix(trimmed, "postgres://") || strings.HasPrefix(trimmed, "postgresql://") {
+		u, err := url.Parse(trimmed)
+		if err != nil || strings.TrimSpace(u.Hostname()) == "" {
+			return errors.New("target_dsn must be a valid PostgreSQL connection string")
+		}
+		if p := u.Port(); p != "" {
+			n, err := strconv.Atoi(p)
+			if err != nil || n < 1 || n > 65535 {
+				return errors.New("target_dsn must be a valid PostgreSQL connection string")
+			}
+		}
+		return nil
+	}
+	if strings.Contains(trimmed, "://") {
+		return errors.New("target_dsn must use postgres://, postgresql://, or libpq keyword=value format")
+	}
+	// Basic syntax check for libpq keyword=value DSN without reading host filesystem (e.g. sslrootcert).
+	if !strings.Contains(trimmed, "=") {
+		return errors.New("target_dsn must be a valid PostgreSQL connection string")
+	}
+	return nil
 }
 
 func validateOptionalEndpoint(ep string) error {

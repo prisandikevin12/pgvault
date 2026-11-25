@@ -16,6 +16,7 @@ import (
 	"github.com/prisandikevin12/pgvault/internal/api"
 	"github.com/prisandikevin12/pgvault/internal/crypto"
 	"github.com/prisandikevin12/pgvault/internal/db"
+	"github.com/prisandikevin12/pgvault/internal/notify"
 )
 
 const defaultListenAddr = ":8080"
@@ -59,7 +60,7 @@ func loadEnvConfig(getenv func(string) string) (apiEnvConfig, error) {
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	if err := runMain(logger); err != nil {
-		logger.Error("api server exited with error", "error", err)
+		logger.Error("api server exited with error", "error", notify.SanitizeMessage(err.Error()))
 		os.Exit(1)
 	}
 }

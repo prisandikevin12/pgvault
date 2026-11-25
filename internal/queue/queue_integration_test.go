@@ -441,4 +441,37 @@ func TestQueue_Integration_StaleJobRecovery(t *testing.T) {
 	if got3.Status != StatusRunning || got3.LeaseExpiresAt == nil || got3.LockedBy != "live-worker-3" {
 		t.Errorf("j3 (active lease) should be untouched, got %+v", got3)
 	}
+
+	// Verify MarkJobVerifyingWithLease extends lease_expires_at forward
+	verifyNow := baseNow.Add(10 * time.Minute)
+	if err := MarkJobVerifyingWithLease(ctx, pool, j3.ID, "live-worker-3", verifyNow, 15*time.Minute); err != nil {
+		t.Fatalf("MarkJobVerifyingWithLease() error: %v", err)
+	}
+	got3After, _ := GetJob(ctx, pool, j3.ID)
+	if got3After.Status != StatusVerifying {
+		t.Fatalf("j3 status = %q, want verifying", got3After.Status)
+	}
+	if got3After.LeaseExpiresAt == nil || !got3After.LeaseExpiresAt.UTC().Equal(verifyNow.Add(15*time.Minute)) {
+		t.Fatalf("j3 LeaseExpiresAt = %v, want extended %v", got3After.LeaseExpiresAt, verifyNow.Add(15*time.Minute))
+	}
+
+	// Verify ClaimNextJobWithLease compares run_after against provided `now` (not DB NOW()).
+	// First claim the recovered j1 so only jFuture remains queued for this target.
+	if _, err := pool.Exec(ctx, "UPDATE backup_jobs SET status = 'succeeded' WHERE id = $1", j1.ID); err != nil {
+		t.Fatalf("mark j1 succeeded error: %v", err)
+	}
+	futureRunAfter := baseNow.Add(2 * time.Hour)
+	jFuture, err := EnqueueJob(ctx, pool, target.ID, 3, futureRunAfter)
+	if err != nil {
+		t.Fatalf("EnqueueJob(jFuture) error: %v", err)
+	}
+	if claimedTooEarly, err := ClaimNextJobWithLease(ctx, pool, "worker-early", baseNow, 15*time.Minute); err != nil {
+		t.Fatalf("ClaimNextJobWithLease(baseNow) error: %v", err)
+	} else if claimedTooEarly != nil && claimedTooEarly.ID == jFuture.ID {
+		t.Fatalf("ClaimNextJobWithLease(baseNow) claimed future job %d prematurely", jFuture.ID)
+	}
+	claimedFuture, err := ClaimNextJobWithLease(ctx, pool, "worker-future", futureRunAfter.Add(time.Minute), 15*time.Minute)
+	if err != nil || claimedFuture == nil || claimedFuture.ID != jFuture.ID {
+		t.Fatalf("ClaimNextJobWithLease(futureNow) = %+v, %v (want job %d)", claimedFuture, err, jFuture.ID)
+	}
 }

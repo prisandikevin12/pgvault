@@ -111,7 +111,14 @@ func (q *Queue) PruneExpiredBackups(ctx context.Context, now time.Time, deleterF
 	return PruneExpiredBackups(ctx, q.pool, now, deleterFactory)
 }
 
+// retentionPruneAdvisoryLockKey is a fixed 64-bit PostgreSQL advisory lock key
+// preventing multiple worker replicas from pruning the same S3 objects concurrently.
+const retentionPruneAdvisoryLockKey int64 = 0x5047565052554E45 // "PGVPRUNE"
+
 // PruneExpiredBackups evaluates retention policies for all targets with retention rules enabled.
+// It uses a non-blocking PostgreSQL session advisory lock so concurrent workers do not race
+// on S3 object deletions or mark_pruned updates; if another worker holds the lock, it returns
+// an empty summary and nil error cleanly.
 func PruneExpiredBackups(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -127,6 +134,25 @@ func PruneExpiredBackups(
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+
+	lockConn, err := pool.Acquire(ctx)
+	if err != nil {
+		return PruneSummary{}, fmt.Errorf("queue: acquire connection for retention lock: %w", err)
+	}
+	defer lockConn.Release()
+
+	var acquired bool
+	if err := lockConn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", retentionPruneAdvisoryLockKey).Scan(&acquired); err != nil {
+		return PruneSummary{}, fmt.Errorf("queue: acquire retention advisory lock: %w", err)
+	}
+	if !acquired {
+		return PruneSummary{}, nil
+	}
+	defer func() {
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = lockConn.Exec(unlockCtx, "SELECT pg_advisory_unlock($1)", retentionPruneAdvisoryLockKey)
+	}()
 
 	targets, err := db.ListTargets(ctx, pool)
 	if err != nil {

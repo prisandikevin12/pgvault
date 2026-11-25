@@ -105,3 +105,84 @@ func TestApplyMigrations_Integration_Idempotent(t *testing.T) {
 		t.Errorf("GetTarget().Name = %q, want %q", fetched.Name, targetName)
 	}
 }
+
+func TestDB_Integration_CreateArtifact_UpsertOnJobRetry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool, err := ConnectPool(ctx, testAppDBDSN())
+	if err != nil {
+		t.Fatalf("ConnectPool() error: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	if err := ApplyMigrations(ctx, pool); err != nil {
+		t.Fatalf("ApplyMigrations() error: %v", err)
+	}
+
+	targetName := fmt.Sprintf("retry-artifact-target-%d", time.Now().UnixNano())
+	target, err := CreateTarget(ctx, pool, BackupTarget{
+		Name:            targetName,
+		TargetDSN:       "postgres://example",
+		StorageRegion:   "us-east-1",
+		StorageBucket:   "pgvault-test",
+		IntervalSeconds: 3600,
+	})
+	if err != nil {
+		t.Fatalf("CreateTarget() error: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanCancel()
+		_, _ = pool.Exec(cleanCtx, "DELETE FROM backup_targets WHERE id = $1", target.ID)
+	})
+
+	var jobID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO backup_jobs (target_id, status, attempts, max_attempts)
+		VALUES ($1, 'running', 1, 3)
+		RETURNING id
+	`, target.ID).Scan(&jobID); err != nil {
+		t.Fatalf("insert job error: %v", err)
+	}
+
+	// Attempt 1 uploads artifact, then fails verification
+	art1, err := CreateArtifact(ctx, pool, BackupArtifact{
+		JobID:              jobID,
+		TargetID:           target.ID,
+		ObjectKey:          "backups/attempt-1.pgv",
+		WrappedDEK:         []byte("dek-attempt-1"),
+		PlaintextBytes:     100,
+		CiphertextBytes:    120,
+		CiphertextSHA256:   "hash-attempt-1",
+		PGMajorVersion:     16,
+		VerificationPassed: false,
+		VerificationError:  "transient docker error",
+	})
+	if err != nil {
+		t.Fatalf("CreateArtifact(attempt 1) error: %v", err)
+	}
+
+	// Attempt 2 retries the same job_id -> must upsert cleanly without unique constraint violation
+	art2, err := CreateArtifact(ctx, pool, BackupArtifact{
+		JobID:              jobID,
+		TargetID:           target.ID,
+		ObjectKey:          "backups/attempt-2.pgv",
+		WrappedDEK:         []byte("dek-attempt-2"),
+		PlaintextBytes:     200,
+		CiphertextBytes:    240,
+		CiphertextSHA256:   "hash-attempt-2",
+		PGMajorVersion:     16,
+		VerificationPassed: false,
+		VerificationError:  "",
+	})
+	if err != nil {
+		t.Fatalf("CreateArtifact(attempt 2 retry) error: %v", err)
+	}
+	if art2.ID != art1.ID {
+		t.Errorf("upserted artifact ID = %d, want existing row ID %d", art2.ID, art1.ID)
+	}
+	if art2.ObjectKey != "backups/attempt-2.pgv" || art2.CiphertextSHA256 != "hash-attempt-2" || art2.VerificationError != "" {
+		t.Errorf("upserted artifact fields not refreshed: %+v", art2)
+	}
+}

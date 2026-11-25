@@ -82,13 +82,30 @@ BUCKET="${PGVAULT_DEFAULT_BUCKET:-pgvault-backups}"
 echo "[pgvault] Starting full stack (app-db, target-db, s3, api, worker, web)..."
 docker compose up -d --build
 
+http_check() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -sf "$url" >/dev/null 2>&1
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O /dev/null "$url" >/dev/null 2>&1
+  else
+    return 2
+  fi
+}
+
 echo "[pgvault] Waiting for API healthcheck on http://127.0.0.1:${API_PORT}/healthz ..."
 for i in $(seq 1 60); do
-  if curl -sf "http://127.0.0.1:${API_PORT}/healthz" >/dev/null 2>&1; then
+  if http_check "http://127.0.0.1:${API_PORT}/healthz"; then
     break
+  else
+    rc=$?
+    if [ "$rc" -eq 2 ]; then
+      echo "Note: neither curl nor wget found; skipping HTTP readiness poll." >&2
+      break
+    fi
   fi
   if [ "$i" -eq 60 ]; then
-    echo "Error: API failed to become healthy within 60s. Check 'docker compose logs api'." >&2
+    echo "Error: API failed to become healthy within 60s. Check 'docker compose logs api' (if switching .env passwords on an existing volume, run 'docker compose down -v')." >&2
     exit 1
   fi
   sleep 1
@@ -96,8 +113,13 @@ done
 
 echo "[pgvault] Waiting for Dashboard on http://127.0.0.1:${WEB_PORT} ..."
 for i in $(seq 1 60); do
-  if curl -sf "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1; then
+  if http_check "http://127.0.0.1:${WEB_PORT}"; then
     break
+  else
+    rc=$?
+    if [ "$rc" -eq 2 ]; then
+      break
+    fi
   fi
   if [ "$i" -eq 60 ]; then
     echo "Warning: Web dashboard did not respond within 60s. Check 'docker compose logs web'." >&2

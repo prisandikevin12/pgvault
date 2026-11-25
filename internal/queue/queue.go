@@ -330,7 +330,7 @@ func ClaimNextJobWithLease(
 			SELECT id
 			FROM backup_jobs
 			WHERE status = 'queued'
-			  AND run_after <= NOW()
+			  AND run_after <= $2
 			ORDER BY run_after ASC, id ASC
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
@@ -453,13 +453,32 @@ func RecoverStaleJobs(ctx context.Context, pool *pgxpool.Pool, now time.Time) (i
 	return recovered, nil
 }
 
-// MarkJobVerifying transitions a running job owned by workerID to verifying.
+// MarkJobVerifying transitions a running job owned by workerID to verifying
+// and refreshes its worker lease using the default lease duration.
 func MarkJobVerifying(ctx context.Context, pool *pgxpool.Pool, jobID int64, workerID string) error {
+	return MarkJobVerifyingWithLease(ctx, pool, jobID, workerID, time.Now().UTC(), DefaultJobLeaseDuration)
+}
+
+// MarkJobVerifyingWithLease transitions a running job owned by workerID to verifying
+// and extends lease_expires_at so long dump+verify runs are not prematurely reclaimed.
+func MarkJobVerifyingWithLease(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	jobID int64,
+	workerID string,
+	now time.Time,
+	leaseDuration time.Duration,
+) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	leaseExpiresAt := ComputeLeaseExpiry(now, leaseDuration)
 	tag, err := pool.Exec(ctx, `
 		UPDATE backup_jobs
-		SET status = 'verifying'
+		SET status = 'verifying',
+			lease_expires_at = $3
 		WHERE id = $1 AND status = 'running' AND locked_by = $2
-	`, jobID, workerID)
+	`, jobID, workerID, leaseExpiresAt)
 	if err != nil {
 		return fmt.Errorf("queue: mark job %d verifying: %w", jobID, err)
 	}

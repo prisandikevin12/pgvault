@@ -62,8 +62,12 @@ services:
       - /bin/sh
       - -ec
       - |
-        curl -fsS -X PUT "http://s3:4566/${PGVAULT_DEFAULT_BUCKET:-pgvault-backups}" >/dev/null
-        echo "Ensured S3 bucket: ${PGVAULT_DEFAULT_BUCKET:-pgvault-backups}"
+        code=$$(curl -sS -o /dev/null -w '%{http_code}' -X PUT "http://s3:4566/${PGVAULT_DEFAULT_BUCKET:-pgvault-backups}")
+        if [ "$$code" != "200" ] && [ "$$code" != "409" ]; then
+          echo "Failed to ensure S3 bucket (HTTP $$code)" >&2
+          exit 1
+        fi
+        echo "Ensured S3 bucket: ${PGVAULT_DEFAULT_BUCKET:-pgvault-backups} (HTTP $$code)"
 
   api:
     build:

@@ -4,6 +4,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
   AlertChannel,
   APIConfig,
+  APIError,
   Artifact,
   checkHealthWithLatency,
   createTarget,
@@ -125,6 +126,8 @@ export default function ControlPlanePage() {
   const [targetDrawerOpen, setTargetDrawerOpen] = useState(false);
   const [editingTarget, setEditingTarget] = useState<Target | null>(null);
   const [savingTarget, setSavingTarget] = useState(false);
+  const [targetDrawerError, setTargetDrawerError] = useState<string | null>(null);
+  const [busyTargetId, setBusyTargetId] = useState<number | null>(null);
   const [inspectedJobId, setInspectedJobId] = useState<number | null>(null);
 
   // Copy & download feedback for artifacts
@@ -180,7 +183,17 @@ export default function ControlPlanePage() {
       setArtifacts(a);
       setAlerts(al);
     } catch (err) {
-      setErrorBanner(err instanceof Error ? err.message : "Failed to load control plane state");
+      if (err instanceof APIError && err.status === 401) {
+        setTargets([]);
+        setJobs([]);
+        setArtifacts([]);
+        setAlerts([]);
+        setErrorBanner(
+          "Unauthorized (401): check your API Key in the Connection settings popover."
+        );
+      } else {
+        setErrorBanner(err instanceof Error ? err.message : "Failed to load control plane state");
+      }
     } finally {
       setLoading(false);
     }
@@ -322,17 +335,20 @@ export default function ControlPlanePage() {
 
   const openCreateTargetDrawer = () => {
     setEditingTarget(null);
+    setTargetDrawerError(null);
     setTargetDrawerOpen(true);
   };
 
   const openEditTargetDrawer = (t: Target) => {
     setEditingTarget(t);
+    setTargetDrawerError(null);
     setTargetDrawerOpen(true);
   };
 
   const handleCreateTarget = async (input: CreateTargetInput) => {
     setSavingTarget(true);
     setErrorBanner(null);
+    setTargetDrawerError(null);
     setSuccessBanner(null);
     try {
       const created = await createTarget(apiCfg, input);
@@ -340,7 +356,8 @@ export default function ControlPlanePage() {
       setSuccessBanner(`Target "${created.name}" (#${created.id}) created with encrypted credentials.`);
       await refreshAll(apiCfg);
     } catch (err) {
-      setErrorBanner(err instanceof Error ? err.message : "Failed to create target");
+      const msg = err instanceof Error ? err.message : "Failed to create target";
+      setTargetDrawerError(msg);
     } finally {
       setSavingTarget(false);
     }
@@ -349,6 +366,7 @@ export default function ControlPlanePage() {
   const handleUpdateTarget = async (id: number, input: UpdateTargetInput) => {
     setSavingTarget(true);
     setErrorBanner(null);
+    setTargetDrawerError(null);
     setSuccessBanner(null);
     try {
       const updated = await updateTarget(apiCfg, id, input);
@@ -357,7 +375,8 @@ export default function ControlPlanePage() {
       setSuccessBanner(`Target "${updated.name}" updated.`);
       await refreshAll(apiCfg);
     } catch (err) {
-      setErrorBanner(err instanceof Error ? err.message : "Failed to update target");
+      const msg = err instanceof Error ? err.message : "Failed to update target";
+      setTargetDrawerError(msg);
     } finally {
       setSavingTarget(false);
     }
@@ -367,6 +386,7 @@ export default function ControlPlanePage() {
     if (!window.confirm(`Delete target "${t.name}" and its job/artifact records?`)) {
       return;
     }
+    setBusyTargetId(t.id);
     setErrorBanner(null);
     setSuccessBanner(null);
     try {
@@ -375,10 +395,13 @@ export default function ControlPlanePage() {
       await refreshAll(apiCfg);
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : "Failed to delete target");
+    } finally {
+      setBusyTargetId(null);
     }
   };
 
   const handleTriggerBackup = async (t: Target) => {
+    setBusyTargetId(t.id);
     setErrorBanner(null);
     setSuccessBanner(null);
     try {
@@ -387,6 +410,8 @@ export default function ControlPlanePage() {
       await refreshAll(apiCfg);
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : "Failed to enqueue backup job");
+    } finally {
+      setBusyTargetId(null);
     }
   };
 
@@ -920,14 +945,16 @@ export default function ControlPlanePage() {
                               <button
                                 type="button"
                                 className="btn btn-primary btn-xs"
+                                disabled={busyTargetId === t.id}
                                 onClick={() => void handleTriggerBackup(t)}
                               >
                                 <PlayIcon />
-                                Backup Now
+                                {busyTargetId === t.id ? "Working..." : "Backup Now"}
                               </button>
                               <button
                                 type="button"
                                 className="btn btn-xs"
+                                disabled={busyTargetId === t.id}
                                 onClick={() => openEditTargetDrawer(t)}
                               >
                                 Edit
@@ -935,6 +962,7 @@ export default function ControlPlanePage() {
                               <button
                                 type="button"
                                 className="btn btn-danger btn-xs"
+                                disabled={busyTargetId === t.id}
                                 onClick={() => void handleDeleteTarget(t)}
                               >
                                 Delete
@@ -1293,9 +1321,11 @@ export default function ControlPlanePage() {
         open={targetDrawerOpen}
         editingTarget={editingTarget}
         submitting={savingTarget}
+        error={targetDrawerError}
         onClose={() => {
           setTargetDrawerOpen(false);
           setEditingTarget(null);
+          setTargetDrawerError(null);
         }}
         onCreate={handleCreateTarget}
         onUpdate={handleUpdateTarget}

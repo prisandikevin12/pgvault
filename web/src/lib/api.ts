@@ -142,6 +142,15 @@ export function resolveDefaultApiBaseUrl(): string {
   return "http://127.0.0.1:8080";
 }
 
+export class APIError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "APIError";
+    this.status = status;
+  }
+}
+
 export function resolveDefaultApiKey(): string {
   return (process.env.NEXT_PUBLIC_API_KEY ?? "").trim();
 }
@@ -184,7 +193,7 @@ async function request<T>(
     const errMsg =
       (parsed && typeof parsed.error === "string" && parsed.error) ||
       `HTTP ${res.status} ${res.statusText}`;
-    throw new Error(errMsg);
+    throw new APIError(res.status, errMsg);
   }
 
   return parsed as T;
@@ -301,7 +310,7 @@ export async function downloadArtifact(
     } catch {
       // ignore non-JSON body
     }
-    throw new Error(msg);
+    throw new APIError(res.status, msg);
   }
 
   const blob = await res.blob();

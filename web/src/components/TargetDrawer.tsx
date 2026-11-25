@@ -8,6 +8,7 @@ interface TargetDrawerProps {
   open: boolean;
   editingTarget: Target | null;
   submitting: boolean;
+  error?: string | null;
   onClose: () => void;
   onCreate: (input: CreateTargetInput) => Promise<void>;
   onUpdate: (id: number, input: UpdateTargetInput) => Promise<void>;
@@ -18,6 +19,7 @@ export function TargetDrawer({
   open,
   editingTarget,
   submitting,
+  error,
   onClose,
   onCreate,
   onUpdate,
@@ -147,6 +149,11 @@ export function TargetDrawer({
         </div>
 
         <form id="target-drawer-form" className="drawer-body" onSubmit={(e) => void handleSubmit(e)}>
+          {error && (
+            <div className="notice notice-error" role="alert">
+              <span>{error}</span>
+            </div>
+          )}
           <div className="form-section">
             <div className="form-section-title">Target Database</div>
             <div className="field">

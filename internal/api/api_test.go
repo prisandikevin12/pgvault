@@ -626,4 +626,46 @@ func TestHandleArtifactDownloadAndDecrypt_Unit(t *testing.T) {
 			t.Fatalf("expected non-200 status for corrupted ciphertext, got 200")
 		}
 	})
+
+	t.Run("stream_download_clears_write_deadline", func(t *testing.T) {
+		rec := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/1/download", nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if !rec.writeDeadlineSet || !rec.writeDeadline.IsZero() {
+			t.Fatalf("expected serveArtifactStream to clear write deadline (zero time), set=%v deadline=%v", rec.writeDeadlineSet, rec.writeDeadline)
+		}
+	})
+}
+
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	writeDeadlineSet bool
+	writeDeadline    time.Time
+}
+
+func (d *deadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	d.writeDeadlineSet = true
+	d.writeDeadline = deadline
+	return nil
+}
+
+func TestCreateTargetRequest_ValidateRejectsInvalidDSNWithoutLeak(t *testing.T) {
+	req := CreateTargetRequest{
+		Name:          "bad-dsn-target",
+		TargetDSN:     "postgres://user:UltraSecretPW@bad host name:99999/db",
+		StorageRegion: "us-east-1",
+		StorageBucket: "pgvault",
+	}
+	err := req.Validate()
+	if err == nil {
+		t.Fatalf("Validate() succeeded for invalid DSN, want error")
+	}
+	if strings.Contains(err.Error(), "UltraSecretPW") {
+		t.Fatalf("Validate() error leaked DSN password: %q", err.Error())
+	}
 }

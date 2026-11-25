@@ -156,3 +156,122 @@ func TestQueue_Integration_PruneExpiredBackups(t *testing.T) {
 	}
 	checkPruned(jPruneErr, true)
 }
+
+func TestQueue_Integration_PruneExpiredBackups_ConcurrentWorkersSafe(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool, err := db.ConnectPool(ctx, testAppDBDSN())
+	if err != nil {
+		t.Fatalf("ConnectPool() error: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	if err := db.ApplyMigrations(ctx, pool); err != nil {
+		t.Fatalf("ApplyMigrations() error: %v", err)
+	}
+
+	targetName := fmt.Sprintf("prune-race-target-%d", time.Now().UnixNano())
+	target, err := db.CreateTarget(ctx, pool, db.BackupTarget{
+		Name:                targetName,
+		TargetDSN:           "postgres://example",
+		StorageRegion:       "us-east-1",
+		StorageBucket:       "pgvault-test",
+		IntervalSeconds:     3600,
+		RetentionKeepLast:   1,
+		RetentionMaxAgeDays: 0,
+	})
+	if err != nil {
+		t.Fatalf("CreateTarget() error: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanCancel()
+		_, _ = pool.Exec(cleanCtx, "DELETE FROM backup_targets WHERE id = $1", target.ID)
+	})
+
+	now := time.Now().UTC().Truncate(time.Second)
+	for i, age := range []time.Duration{1 * time.Hour, 2 * time.Hour, 3 * time.Hour} {
+		j, err := EnqueueJob(ctx, pool, target.ID, 3, now.Add(-age))
+		if err != nil {
+			t.Fatalf("EnqueueJob(%d) error: %v", i, err)
+		}
+		_, _ = pool.Exec(ctx, "UPDATE backup_jobs SET status = 'succeeded', created_at = $2 WHERE id = $1", j.ID, now.Add(-age))
+		art, err := db.CreateArtifact(ctx, pool, db.BackupArtifact{
+			JobID:              j.ID,
+			TargetID:           target.ID,
+			ObjectKey:          fmt.Sprintf("backups/race-%d-%d.pgv1", target.ID, i),
+			WrappedDEK:         []byte("dek"),
+			PlaintextBytes:     100,
+			CiphertextBytes:    120,
+			CiphertextSHA256:   "deadbeef",
+			PGMajorVersion:     16,
+			VerificationPassed: true,
+		})
+		if err != nil {
+			t.Fatalf("CreateArtifact(%d) error: %v", i, err)
+		}
+		_, _ = pool.Exec(ctx, "UPDATE backup_artifacts SET created_at = $2 WHERE id = $1", art.ID, now.Add(-age))
+	}
+
+	slowDeleter := &slowObjectDeleter{delay: 120 * time.Millisecond}
+	q := New(pool)
+
+	var (
+		wg          sync.WaitGroup
+		mu          sync.Mutex
+		totalErrors int
+		totalPruned int
+		pruneErrs   []error
+		barrier     = make(chan struct{})
+	)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-barrier
+			sum, err := q.PruneExpiredBackups(ctx, now, func(_ context.Context, _ db.BackupTarget) (ObjectDeleter, error) {
+				return slowDeleter, nil
+			})
+			mu.Lock()
+			totalErrors += sum.Errors
+			totalPruned += sum.ObjectsPruned
+			if err != nil {
+				pruneErrs = append(pruneErrs, err)
+			}
+			mu.Unlock()
+		}()
+	}
+	close(barrier)
+	wg.Wait()
+
+	if len(pruneErrs) > 0 || totalErrors > 0 {
+		t.Fatalf("concurrent PruneExpiredBackups produced errors: totalErrors=%d errs=%v", totalErrors, pruneErrs)
+	}
+	if totalPruned < 2 {
+		t.Fatalf("totalPruned = %d, want >= 2", totalPruned)
+	}
+
+	// Ensure no object key was deleted twice
+	seen := make(map[string]int)
+	for _, k := range slowDeleter.deleted {
+		seen[k]++
+		if seen[k] > 1 {
+			t.Errorf("object key %q was deleted %d times concurrently (want 1)", k, seen[k])
+		}
+	}
+}
+
+type slowObjectDeleter struct {
+	mu      sync.Mutex
+	delay   time.Duration
+	deleted []string
+}
+
+func (s *slowObjectDeleter) DeleteObject(_ context.Context, key string) error {
+	time.Sleep(s.delay)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleted = append(s.deleted, key)
+	return nil
+}

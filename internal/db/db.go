@@ -390,6 +390,19 @@ func CreateArtifact(ctx context.Context, pool *pgxpool.Pool, a BackupArtifact) (
 			ciphertext_bytes, ciphertext_sha256, pg_major_version, tables_json,
 			verification_passed, restore_duration_ms, verification_error
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		ON CONFLICT (job_id) DO UPDATE SET
+			object_key = EXCLUDED.object_key,
+			wrapped_dek = EXCLUDED.wrapped_dek,
+			plaintext_bytes = EXCLUDED.plaintext_bytes,
+			ciphertext_bytes = EXCLUDED.ciphertext_bytes,
+			ciphertext_sha256 = EXCLUDED.ciphertext_sha256,
+			pg_major_version = EXCLUDED.pg_major_version,
+			tables_json = EXCLUDED.tables_json,
+			verification_passed = EXCLUDED.verification_passed,
+			restore_duration_ms = EXCLUDED.restore_duration_ms,
+			verification_error = EXCLUDED.verification_error,
+			pruned_at = NULL,
+			created_at = NOW()
 		RETURNING id, job_id, target_id, object_key, wrapped_dek, plaintext_bytes,
 			ciphertext_bytes, ciphertext_sha256, pg_major_version, tables_json,
 			verification_passed, restore_duration_ms, verification_error, pruned_at, created_at

@@ -328,7 +328,7 @@ func (w *Worker) executeJob(ctx context.Context, job *queue.Job) error {
 		return err
 	}
 
-	if err := queue.MarkJobVerifying(ctx, w.pool, job.ID, w.cfg.WorkerID); err != nil {
+	if err := queue.MarkJobVerifyingWithLease(ctx, w.pool, job.ID, w.cfg.WorkerID, time.Now().UTC(), w.cfg.JobLeaseDuration); err != nil {
 		w.handleJobFailure(ctx, job, target, objectKey, err, true)
 		return err
 	}
@@ -361,7 +361,7 @@ func (w *Worker) executeJob(ctx context.Context, job *queue.Job) error {
 	}
 
 	if updateErr := db.UpdateArtifactVerification(ctx, w.pool, artifact.ID, verPassed, verDurMs, verErrClean); updateErr != nil {
-		w.logger.Error("failed to update artifact verification status", "artifact_id", artifact.ID, "error", updateErr)
+		w.logger.Error("failed to update artifact verification status", "artifact_id", artifact.ID, "error", notify.SanitizeMessage(updateErr.Error()))
 	}
 
 	if verifyErr != nil || !verPassed {
@@ -373,7 +373,7 @@ func (w *Worker) executeJob(ctx context.Context, job *queue.Job) error {
 	}
 
 	if err := queue.MarkJobSucceeded(ctx, w.pool, job.ID, w.cfg.WorkerID); err != nil {
-		w.logger.Error("failed to mark job succeeded", "job_id", job.ID, "error", err)
+		w.logger.Error("failed to mark job succeeded", "job_id", job.ID, "error", notify.SanitizeMessage(err.Error()))
 		return err
 	}
 
@@ -406,7 +406,7 @@ func (w *Worker) handleJobFailure(ctx context.Context, job *queue.Job, target *d
 	backoff := queue.ComputeBackoff(job.Attempts, w.cfg.BaseBackoff, w.cfg.MaxBackoff)
 	status, err := queue.RequeueOrFailJob(cleanupCtx, w.pool, job.ID, w.cfg.WorkerID, cause, retryable, backoff)
 	if err != nil {
-		w.logger.Error("failed to update failed job state", "job_id", job.ID, "error", err)
+		w.logger.Error("failed to update failed job state", "job_id", job.ID, "error", notify.SanitizeMessage(err.Error()))
 		return
 	}
 
@@ -440,7 +440,7 @@ func (w *Worker) dispatchAlert(ctx context.Context, target *db.BackupTarget, eve
 	}
 	channels, err := db.ListActiveAlertChannels(ctx, w.pool, targetID)
 	if err != nil {
-		w.logger.Warn("failed to load alert channels", "job_id", event.JobID, "error", err)
+		w.logger.Warn("failed to load alert channels", "job_id", event.JobID, "error", notify.SanitizeMessage(err.Error()))
 		return
 	}
 
@@ -457,12 +457,12 @@ func (w *Worker) dispatchAlert(ctx context.Context, target *db.BackupTarget, eve
 
 		token, err := db.UnprotectSecret(w.cfg.KEK, ch.BotToken)
 		if err != nil {
-			w.logger.Warn("failed to decrypt alert channel token", "channel_id", ch.ID, "error", err)
+			w.logger.Warn("failed to decrypt alert channel token", "channel_id", ch.ID, "error", notify.SanitizeMessage(err.Error()))
 			continue
 		}
 		tg, err := notify.NewTelegramNotifier(token, ch.ChatID)
 		if err != nil {
-			w.logger.Warn("invalid telegram alert channel config", "channel_id", ch.ID, "error", err)
+			w.logger.Warn("invalid telegram alert channel config", "channel_id", ch.ID, "error", notify.SanitizeMessage(err.Error()))
 			continue
 		}
 		if err := tg.Notify(ctx, event); err != nil {
