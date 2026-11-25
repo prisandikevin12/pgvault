@@ -5,10 +5,15 @@ import {
   AlertChannel,
   APIConfig,
   Artifact,
-  checkHealth,
+  checkHealthWithLatency,
   createTarget,
+  CreateTargetInput,
   deleteTarget,
   formatBytes,
+  formatInterval,
+  formatRelativeTime,
+  formatTimestamp,
+  HealthStatus,
   Job,
   listAlerts,
   listArtifacts,
@@ -17,116 +22,161 @@ import {
   resolveDefaultApiBaseUrl,
   Target,
   triggerBackup,
+  updateTarget,
+  UpdateTargetInput,
   upsertTelegramAlert,
 } from "@/lib/api";
+import {
+  ActivityIcon,
+  ArchiveIcon,
+  BellIcon,
+  CheckIcon,
+  CopyIcon,
+  DatabaseIcon,
+  MenuIcon,
+  PlayIcon,
+  PlugIcon,
+  PlusIcon,
+  RefreshIcon,
+  SearchIcon,
+  ShieldIcon,
+  XIcon,
+} from "@/components/Icons";
+import { ConnectionPopover } from "@/components/ConnectionPopover";
+import { TargetDrawer } from "@/components/TargetDrawer";
+import { JobInspectorDrawer } from "@/components/JobInspectorDrawer";
 
 const STORAGE_KEY_URL = "pgvault_api_base_url";
 const STORAGE_KEY_API_KEY = "pgvault_api_key";
 
-type TabKey = "targets" | "jobs" | "alerts";
+type NavSection = "overview" | "targets" | "artifacts" | "alerts";
+type JobStatusFilter = "all" | "succeeded" | "failed" | "queued";
 
-function jobStatusBadge(status: string): string {
-  switch (status) {
+function renderJobStatusBadge(job: Job) {
+  const isStaleRecovered =
+    job.error_message?.toLowerCase().includes("lease expired") ?? false;
+
+  switch (job.status) {
     case "succeeded":
-      return "badge badge-success";
+      return (
+        <span className="badge badge-emerald">
+          <span className="status-dot dot-emerald" />
+          succeeded
+        </span>
+      );
     case "failed":
-      return "badge badge-danger";
+      return (
+        <span className="badge badge-rose">
+          <span className="status-dot dot-rose" />
+          failed
+        </span>
+      );
     case "running":
     case "verifying":
-      return "badge badge-info";
+      return (
+        <span className="badge badge-amber">
+          <span className="status-dot dot-amber" />
+          {job.status}
+        </span>
+      );
+    case "queued":
+      return (
+        <span className="badge badge-amber">
+          <span className="status-dot dot-amber" />
+          {isStaleRecovered ? "queued · recovered" : "queued"}
+        </span>
+      );
     default:
-      return "badge badge-warning";
+      return <span className="badge badge-neutral">{job.status}</span>;
   }
 }
 
-export default function DashboardPage() {
-  const [baseUrl, setBaseUrl] = useState(() => resolveDefaultApiBaseUrl());
+export default function ControlPlanePage() {
+  const [defaultUrl, setDefaultUrl] = useState("http://127.0.0.1:8080");
+  const [baseUrl, setBaseUrl] = useState("http://127.0.0.1:8080");
   const [apiKey, setApiKey] = useState("");
   const [configLoaded, setConfigLoaded] = useState(false);
 
-  const [activeTab, setActiveTab] = useState<TabKey>("targets");
-  const [healthy, setHealthy] = useState<boolean | null>(null);
+  const [section, setSection] = useState<NavSection>("overview");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [connOpen, setConnOpen] = useState(false);
+
+  const [health, setHealth] = useState<HealthStatus | null>(null);
   const [loading, setLoading] = useState(false);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [successBanner, setSuccessBanner] = useState<string | null>(null);
 
   const [targets, setTargets] = useState<Target[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [alerts, setAlerts] = useState<AlertChannel[]>([]);
 
-  // Create target form state
-  const [targetName, setTargetName] = useState("");
-  const [targetDSN, setTargetDSN] = useState("");
-  const [storageEndpoint, setStorageEndpoint] = useState("");
-  const [storageRegion, setStorageRegion] = useState("us-east-1");
-  const [storageBucket, setStorageBucket] = useState("");
-  const [storageAccessKey, setStorageAccessKey] = useState("");
-  const [storageSecretKey, setStorageSecretKey] = useState("");
-  const [forcePathStyle, setForcePathStyle] = useState(false);
-  const [intervalSeconds, setIntervalSeconds] = useState(86400);
-  const [retentionKeepLast, setRetentionKeepLast] = useState(7);
-  const [retentionMaxAgeDays, setRetentionMaxAgeDays] = useState(30);
-  const [sanityQuery, setSanityQuery] = useState("");
-  const [submittingTarget, setSubmittingTarget] = useState(false);
+  // Job table filters
+  const [jobStatusFilter, setJobStatusFilter] = useState<JobStatusFilter>("all");
+  const [jobTargetFilter, setJobTargetFilter] = useState<string>("all");
+  const [searchQuery, setSearchQuery] = useState("");
 
-  // Telegram alert form state
+  // Drawers
+  const [targetDrawerOpen, setTargetDrawerOpen] = useState(false);
+  const [editingTarget, setEditingTarget] = useState<Target | null>(null);
+  const [savingTarget, setSavingTarget] = useState(false);
+  const [inspectedJobId, setInspectedJobId] = useState<number | null>(null);
+
+  // Copy feedback for artifact hashes
+  const [copiedHashId, setCopiedHashId] = useState<number | null>(null);
+
+  // Telegram Alerts form state
   const [alertTargetId, setAlertTargetId] = useState<string>("global");
   const [telegramBotToken, setTelegramBotToken] = useState("");
   const [telegramChatId, setTelegramChatId] = useState("");
   const [notifyOnFailure, setNotifyOnFailure] = useState(true);
   const [notifyOnSuccess, setNotifyOnSuccess] = useState(false);
   const [alertEnabled, setAlertEnabled] = useState(true);
-  const [submittingAlert, setSubmittingAlert] = useState(false);
+  const [savingAlert, setSavingAlert] = useState(false);
 
   useEffect(() => {
+    const resolvedDefault = resolveDefaultApiBaseUrl();
+    setDefaultUrl(resolvedDefault);
     const savedUrl = window.localStorage.getItem(STORAGE_KEY_URL);
     const savedKey = window.localStorage.getItem(STORAGE_KEY_API_KEY);
-    if (savedUrl && savedUrl.trim() !== "") {
-      setBaseUrl(savedUrl);
-    } else {
-      setBaseUrl(resolveDefaultApiBaseUrl());
-    }
+    setBaseUrl(savedUrl && savedUrl.trim() !== "" ? savedUrl : resolvedDefault);
     if (savedKey) setApiKey(savedKey);
     setConfigLoaded(true);
   }, []);
 
   const apiCfg: APIConfig = useMemo(
-    () => ({ baseUrl: baseUrl.trim() || resolveDefaultApiBaseUrl(), apiKey }),
-    [baseUrl, apiKey]
+    () => ({ baseUrl: baseUrl.trim() || defaultUrl, apiKey }),
+    [baseUrl, apiKey, defaultUrl]
   );
 
-  const refreshAll = useCallback(
-    async (cfg: APIConfig) => {
-      setLoading(true);
-      setErrorMsg(null);
-      try {
-        const ok = await checkHealth(cfg);
-        setHealthy(ok);
-        if (!ok) {
-          setErrorMsg(
-            `Cannot reach PGVault API at ${cfg.baseUrl}. Check URL and ensure cmd/api is running.`
-          );
-          return;
-        }
-        const [t, j, a, al] = await Promise.all([
-          listTargets(cfg),
-          listJobs(cfg),
-          listArtifacts(cfg),
-          listAlerts(cfg),
-        ]);
-        setTargets(t);
-        setJobs(j);
-        setArtifacts(a);
-        setAlerts(al);
-      } catch (err) {
-        setErrorMsg(err instanceof Error ? err.message : "Failed to fetch dashboard data");
-      } finally {
-        setLoading(false);
+  const refreshAll = useCallback(async (cfg: APIConfig) => {
+    setLoading(true);
+    setErrorBanner(null);
+    try {
+      const h = await checkHealthWithLatency(cfg);
+      setHealth(h);
+      if (!h.ok) {
+        setErrorBanner(
+          `Unable to reach PGVault API at ${cfg.baseUrl}. Open Connection to verify API Base URL.`
+        );
+        return;
       }
-    },
-    []
-  );
+      const [t, j, a, al] = await Promise.all([
+        listTargets(cfg),
+        listJobs(cfg),
+        listArtifacts(cfg),
+        listAlerts(cfg),
+      ]);
+      setTargets(t);
+      setJobs(j);
+      setArtifacts(a);
+      setAlerts(al);
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : "Failed to load control plane state");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     if (configLoaded) {
@@ -134,99 +184,196 @@ export default function DashboardPage() {
     }
   }, [configLoaded]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const targetNameById = useMemo(() => {
-    const m = new Map<number, string>();
+  const targetById = useMemo(() => {
+    const m = new Map<number, Target>();
     for (const t of targets) {
-      m.set(t.id, t.name);
+      m.set(t.id, t);
     }
     return m;
   }, [targets]);
 
-  const verifiedArtifactsCount = useMemo(
-    () => artifacts.filter((a) => a.verification_passed).length,
-    [artifacts]
+  const inspectedJob = useMemo(
+    () => (inspectedJobId === null ? null : jobs.find((j) => j.id === inspectedJobId) ?? null),
+    [jobs, inspectedJobId]
   );
 
-  const avgRestoreMs = useMemo(() => {
+  const jobCounts = useMemo(() => {
+    let succeeded = 0;
+    let failed = 0;
+    let queued = 0;
+    let active = 0;
+    for (const j of jobs) {
+      if (j.status === "succeeded") succeeded++;
+      else if (j.status === "failed") failed++;
+      else if (j.status === "queued") queued++;
+      else if (j.status === "running" || j.status === "verifying") active++;
+    }
+    return { all: jobs.length, succeeded, failed, queued, active };
+  }, [jobs]);
+
+  const filteredJobs = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return jobs.filter((j) => {
+      if (jobStatusFilter === "succeeded" && j.status !== "succeeded") return false;
+      if (jobStatusFilter === "failed" && j.status !== "failed") return false;
+      if (
+        jobStatusFilter === "queued" &&
+        j.status !== "queued" &&
+        j.status !== "running" &&
+        j.status !== "verifying"
+      ) {
+        return false;
+      }
+      if (jobTargetFilter !== "all" && String(j.target_id) !== jobTargetFilter) {
+        return false;
+      }
+      if (q !== "") {
+        const tName = (targetById.get(j.target_id)?.name ?? "").toLowerCase();
+        const key = (j.artifact?.object_key ?? "").toLowerCase();
+        const errTxt = (j.error_message ?? "").toLowerCase();
+        const idStr = `#${j.id}`;
+        if (
+          !tName.includes(q) &&
+          !key.includes(q) &&
+          !errTxt.includes(q) &&
+          !idStr.includes(q) &&
+          !String(j.id).includes(q)
+        ) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }, [jobs, jobStatusFilter, jobTargetFilter, searchQuery, targetById]);
+
+  const filteredArtifacts = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return artifacts.filter((a) => {
+      if (jobTargetFilter !== "all" && String(a.target_id) !== jobTargetFilter) {
+        return false;
+      }
+      if (q !== "") {
+        const tName = (targetById.get(a.target_id)?.name ?? "").toLowerCase();
+        if (
+          !tName.includes(q) &&
+          !a.object_key.toLowerCase().includes(q) &&
+          !a.ciphertext_sha256.toLowerCase().includes(q) &&
+          !String(a.job_id).includes(q)
+        ) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }, [artifacts, jobTargetFilter, searchQuery, targetById]);
+
+  const verificationMetrics = useMemo(() => {
     const verified = artifacts.filter((a) => a.verification_passed);
-    if (verified.length === 0) return 0;
-    const sum = verified.reduce((acc, a) => acc + a.restore_duration_ms, 0);
-    return Math.round(sum / verified.length);
+    const activeArtifacts = artifacts.filter((a) => !a.pruned_at);
+    const prunedArtifacts = artifacts.length - activeArtifacts.length;
+    const avgMs =
+      verified.length > 0
+        ? Math.round(verified.reduce((acc, a) => acc + a.restore_duration_ms, 0) / verified.length)
+        : 0;
+    const passRate =
+      artifacts.length > 0 ? Math.round((verified.length / artifacts.length) * 100) : 0;
+    return { verifiedCount: verified.length, activeCount: activeArtifacts.length, prunedCount: prunedArtifacts, avgMs, passRate };
   }, [artifacts]);
 
-  const handleSaveSettings = (e: FormEvent) => {
-    e.preventDefault();
-    window.localStorage.setItem(STORAGE_KEY_URL, apiCfg.baseUrl);
-    window.localStorage.setItem(STORAGE_KEY_API_KEY, apiCfg.apiKey);
-    setSuccessMsg("API connection settings saved in browser localStorage.");
-    void refreshAll(apiCfg);
+  const handleSaveConnection = (nextUrl: string, nextKey: string) => {
+    const nextCfg: APIConfig = { baseUrl: nextUrl, apiKey: nextKey };
+    setBaseUrl(nextUrl);
+    setApiKey(nextKey);
+    window.localStorage.setItem(STORAGE_KEY_URL, nextUrl);
+    window.localStorage.setItem(STORAGE_KEY_API_KEY, nextKey);
+    setSuccessBanner(`Connected API target updated to ${nextUrl}`);
+    void refreshAll(nextCfg);
   };
 
-  const handleCreateTarget = async (e: FormEvent) => {
-    e.preventDefault();
-    setSubmittingTarget(true);
-    setErrorMsg(null);
-    setSuccessMsg(null);
+  const handleResetConnection = () => {
+    window.localStorage.removeItem(STORAGE_KEY_URL);
+    window.localStorage.removeItem(STORAGE_KEY_API_KEY);
+    setBaseUrl(defaultUrl);
+    setApiKey("");
+    setSuccessBanner(`Reset API connection to default (${defaultUrl})`);
+    void refreshAll({ baseUrl: defaultUrl, apiKey: "" });
+  };
+
+  const openCreateTargetDrawer = () => {
+    setEditingTarget(null);
+    setTargetDrawerOpen(true);
+  };
+
+  const openEditTargetDrawer = (t: Target) => {
+    setEditingTarget(t);
+    setTargetDrawerOpen(true);
+  };
+
+  const handleCreateTarget = async (input: CreateTargetInput) => {
+    setSavingTarget(true);
+    setErrorBanner(null);
+    setSuccessBanner(null);
     try {
-      const created = await createTarget(apiCfg, {
-        name: targetName,
-        target_dsn: targetDSN,
-        storage_endpoint: storageEndpoint,
-        storage_region: storageRegion,
-        storage_bucket: storageBucket,
-        storage_access_key: storageAccessKey,
-        storage_secret_key: storageSecretKey,
-        storage_force_path_style: forcePathStyle,
-        sanity_query: sanityQuery,
-        interval_seconds: Number(intervalSeconds) || 86400,
-        retention_keep_last: Math.max(0, Number(retentionKeepLast) || 0),
-        retention_max_age_days: Math.max(0, Number(retentionMaxAgeDays) || 0),
-      });
-      setSuccessMsg(`Created target "${created.name}" (#${created.id}). Credentials encrypted at rest.`);
-      setTargetName("");
-      setTargetDSN("");
-      setStorageSecretKey("");
-      setSanityQuery("");
+      const created = await createTarget(apiCfg, input);
+      setTargetDrawerOpen(false);
+      setSuccessBanner(`Target "${created.name}" (#${created.id}) created with encrypted credentials.`);
       await refreshAll(apiCfg);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to create target");
+      setErrorBanner(err instanceof Error ? err.message : "Failed to create target");
     } finally {
-      setSubmittingTarget(false);
+      setSavingTarget(false);
     }
   };
 
-  const handleTriggerBackup = async (target: Target) => {
-    setErrorMsg(null);
-    setSuccessMsg(null);
+  const handleUpdateTarget = async (id: number, input: UpdateTargetInput) => {
+    setSavingTarget(true);
+    setErrorBanner(null);
+    setSuccessBanner(null);
     try {
-      const job = await triggerBackup(apiCfg, target.id);
-      setSuccessMsg(`Enqueued backup job #${job.id} for "${target.name}" (status: ${job.status}).`);
+      const updated = await updateTarget(apiCfg, id, input);
+      setTargetDrawerOpen(false);
+      setEditingTarget(null);
+      setSuccessBanner(`Target "${updated.name}" updated.`);
       await refreshAll(apiCfg);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to trigger backup");
+      setErrorBanner(err instanceof Error ? err.message : "Failed to update target");
+    } finally {
+      setSavingTarget(false);
     }
   };
 
-  const handleDeleteTarget = async (target: Target) => {
-    if (!window.confirm(`Delete backup target "${target.name}" and its history?`)) {
+  const handleDeleteTarget = async (t: Target) => {
+    if (!window.confirm(`Delete target "${t.name}" and its job/artifact records?`)) {
       return;
     }
-    setErrorMsg(null);
-    setSuccessMsg(null);
+    setErrorBanner(null);
+    setSuccessBanner(null);
     try {
-      await deleteTarget(apiCfg, target.id);
-      setSuccessMsg(`Deleted target "${target.name}".`);
+      await deleteTarget(apiCfg, t.id);
+      setSuccessBanner(`Deleted target "${t.name}".`);
       await refreshAll(apiCfg);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to delete target");
+      setErrorBanner(err instanceof Error ? err.message : "Failed to delete target");
     }
   };
 
-  const handleSaveTelegramAlert = async (e: FormEvent) => {
+  const handleTriggerBackup = async (t: Target) => {
+    setErrorBanner(null);
+    setSuccessBanner(null);
+    try {
+      const job = await triggerBackup(apiCfg, t.id);
+      setSuccessBanner(`Enqueued Job #${job.id} for "${t.name}" (${job.status}).`);
+      await refreshAll(apiCfg);
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : "Failed to enqueue backup job");
+    }
+  };
+
+  const handleSaveAlert = async (e: FormEvent) => {
     e.preventDefault();
-    setSubmittingAlert(true);
-    setErrorMsg(null);
-    setSuccessMsg(null);
+    setSavingAlert(true);
+    setErrorBanner(null);
+    setSuccessBanner(null);
     try {
       const saved = await upsertTelegramAlert(apiCfg, {
         target_id: alertTargetId === "global" ? null : Number(alertTargetId),
@@ -236,641 +383,876 @@ export default function DashboardPage() {
         notify_on_success: notifyOnSuccess,
         enabled: alertEnabled,
       });
-      setSuccessMsg(
-        `Saved Telegram alert channel #${saved.id} (Chat ID: ${saved.chat_id}). Bot token stored encrypted.`
-      );
       setTelegramBotToken("");
+      setSuccessBanner(`Saved Telegram alert channel #${saved.id} (Chat ${saved.chat_id}).`);
       await refreshAll(apiCfg);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to save Telegram alert");
+      setErrorBanner(err instanceof Error ? err.message : "Failed to save Telegram alert");
     } finally {
-      setSubmittingAlert(false);
+      setSavingAlert(false);
     }
   };
 
+  const copyHash = async (artifact: Artifact) => {
+    try {
+      await navigator.clipboard.writeText(artifact.ciphertext_sha256);
+      setCopiedHashId(artifact.id);
+      setTimeout(() => setCopiedHashId((prev) => (prev === artifact.id ? null : prev)), 1600);
+    } catch {
+      // Clipboard unavailable
+    }
+  };
+
+  const sectionTitle: Record<NavSection, string> = {
+    overview: "Overview & Jobs",
+    targets: "Targets",
+    artifacts: "Artifacts",
+    alerts: "Telegram Alerts",
+  };
+
+  const selectSection = (next: NavSection) => {
+    setSection(next);
+    setMobileNavOpen(false);
+  };
+
   return (
-    <main className="container">
-      <header className="header">
-        <div className="brand">
-          <h1>PGVault Control Plane</h1>
-          <p>Zero-knowledge PostgreSQL backups with automated Docker restore verification</p>
+    <div className="shell">
+      {/* Mobile Sidebar Backdrop */}
+      {mobileNavOpen && (
+        <div
+          className="popover-backdrop"
+          style={{ background: "rgba(0,0,0,0.5)", zIndex: 25 }}
+          onClick={() => setMobileNavOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
+      {/* Left Sidebar (220px) */}
+      <aside className={`sidebar ${mobileNavOpen ? "mobile-open" : ""}`}>
+        <div className="sidebar-brand">
+          <div className="brand-mark">
+            <span className="brand-glyph">
+              <ShieldIcon />
+            </span>
+            <span>pgvault</span>
+          </div>
+          <span className="brand-tag mono">v1</span>
         </div>
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          {healthy === true && <span className="badge badge-success">API Connected</span>}
-          {healthy === false && <span className="badge badge-danger">API Offline</span>}
-          {healthy === null && <span className="badge badge-muted">Checking API...</span>}
+
+        <nav className="sidebar-nav" aria-label="Primary Navigation">
+          <div className="sidebar-section-label">Observability</div>
           <button
             type="button"
-            className="btn btn-secondary btn-sm"
-            disabled={loading}
-            onClick={() => void refreshAll(apiCfg)}
+            className={`nav-item ${section === "overview" ? "active" : ""}`}
+            onClick={() => selectSection("overview")}
           >
-            {loading ? "Refreshing..." : "Refresh"}
+            <span className="nav-item-left">
+              <ActivityIcon />
+              Overview &amp; Jobs
+            </span>
+            <span className="nav-count">{jobs.length}</span>
           </button>
-        </div>
-      </header>
 
-      {/* Connection Settings */}
-      <section className="card">
-        <h2>API Connection Settings (localStorage)</h2>
-        <form className="form-grid" onSubmit={handleSaveSettings}>
-          <div className="field">
-            <label htmlFor="api-base-url">API Base URL</label>
-            <input
-              id="api-base-url"
-              type="text"
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder="https://api.pgvault.example.com"
-              required
-            />
+          <button
+            type="button"
+            className={`nav-item ${section === "targets" ? "active" : ""}`}
+            onClick={() => selectSection("targets")}
+          >
+            <span className="nav-item-left">
+              <DatabaseIcon />
+              Targets
+            </span>
+            <span className="nav-count">{targets.length}</span>
+          </button>
+
+          <button
+            type="button"
+            className={`nav-item ${section === "artifacts" ? "active" : ""}`}
+            onClick={() => selectSection("artifacts")}
+          >
+            <span className="nav-item-left">
+              <ArchiveIcon />
+              Artifacts
+            </span>
+            <span className="nav-count">{artifacts.length}</span>
+          </button>
+
+          <div className="sidebar-section-label" style={{ marginTop: 8 }}>
+            Operations
           </div>
-          <div className="field">
-            <label htmlFor="api-key">API Key (Bearer / X-API-Key, optional in dev)</label>
-            <input
-              id="api-key"
-              type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder="PGVAULT_API_KEY"
-            />
+          <button
+            type="button"
+            className={`nav-item ${section === "alerts" ? "active" : ""}`}
+            onClick={() => selectSection("alerts")}
+          >
+            <span className="nav-item-left">
+              <BellIcon />
+              Alerts
+            </span>
+            <span className="nav-count">{alerts.filter((a) => a.enabled).length}</span>
+          </button>
+        </nav>
+
+        <div className="sidebar-footer">
+          <span>Control Plane Endpoint</span>
+          <span className="sidebar-footer-endpoint mono" title={apiCfg.baseUrl}>
+            {apiCfg.baseUrl}
+          </span>
+        </div>
+      </aside>
+
+      {/* Main Column */}
+      <div className="main-area">
+        {/* Top Utility Bar (48px) */}
+        <header className="topbar">
+          <div className="topbar-left">
+            <button
+              type="button"
+              className="btn btn-ghost btn-icon mobile-menu-btn"
+              onClick={() => setMobileNavOpen((v) => !v)}
+              aria-label="Toggle navigation"
+            >
+              <MenuIcon />
+            </button>
+            <div className="breadcrumb">
+              <span className="breadcrumb-ws mono">pgvault</span>
+              <span>/</span>
+              <span className="breadcrumb-current">{sectionTitle[section]}</span>
+            </div>
           </div>
-          <div className="field" style={{ justifyContent: "flex-end" }}>
-            <button type="submit" className="btn btn-primary" disabled={loading}>
-              Save &amp; Connect
+
+          <div className="topbar-right">
+            <div className="health-pill" title={`API endpoint: ${apiCfg.baseUrl}`}>
+              <span
+                className={`status-dot ${
+                  health === null
+                    ? "dot-muted"
+                    : health.ok
+                    ? "dot-emerald"
+                    : "dot-rose"
+                }`}
+              />
+              {health === null && <span>Checking</span>}
+              {health?.ok && (
+                <span className="mono">
+                  Online · {health.latencyMs}ms
+                </span>
+              )}
+              {health && !health.ok && <span style={{ color: "var(--rose)" }}>Offline</span>}
+            </div>
+
+            <button
+              type="button"
+              className="btn"
+              onClick={() => setConnOpen((v) => !v)}
+            >
+              <PlugIcon />
+              Connection
+            </button>
+
+            <button
+              type="button"
+              className="btn"
+              disabled={loading}
+              onClick={() => void refreshAll(apiCfg)}
+            >
+              <RefreshIcon />
+              {loading ? "Syncing" : "Refresh"}
+            </button>
+
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={openCreateTargetDrawer}
+            >
+              <PlusIcon />
+              New Target
             </button>
           </div>
-        </form>
-      </section>
+        </header>
 
-      {errorMsg && <div className="banner banner-error">{errorMsg}</div>}
-      {successMsg && <div className="banner banner-success">{successMsg}</div>}
+        {/* Main Workspace Content */}
+        <main className="content">
+          {errorBanner && (
+            <div className="notice notice-error" role="alert">
+              <span>{errorBanner}</span>
+              <button
+                type="button"
+                className="btn btn-ghost btn-icon"
+                onClick={() => setErrorBanner(null)}
+                aria-label="Dismiss error"
+              >
+                <XIcon />
+              </button>
+            </div>
+          )}
 
-      {/* Summary Stats */}
-      <section className="grid-4">
-        <div className="stat-card">
-          <div className="stat-label">Backup Targets</div>
-          <div className="stat-value">{targets.length}</div>
-          <div className="stat-sub">AES-256-GCM envelope encrypted</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-label">Recent Jobs</div>
-          <div className="stat-value">{jobs.length}</div>
-          <div className="stat-sub">
-            {jobs.filter((j) => j.status === "succeeded").length} succeeded /{" "}
-            {jobs.filter((j) => j.status === "failed").length} failed
-          </div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-label">Verified Artifacts</div>
-          <div className="stat-value">
-            {verifiedArtifactsCount} / {artifacts.length}
-          </div>
-          <div className="stat-sub">
-            {avgRestoreMs > 0 ? `Avg restore: ${avgRestoreMs} ms` : "No restore runs yet"}
-          </div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-label">Telegram Alerts</div>
-          <div className="stat-value">
-            {alerts.filter((a) => a.enabled).length} active
-          </div>
-          <div className="stat-sub">{alerts.length} channel(s) configured</div>
-        </div>
-      </section>
+          {successBanner && (
+            <div className="notice notice-success" role="status">
+              <span>{successBanner}</span>
+              <button
+                type="button"
+                className="btn btn-ghost btn-icon"
+                onClick={() => setSuccessBanner(null)}
+                aria-label="Dismiss notification"
+              >
+                <XIcon />
+              </button>
+            </div>
+          )}
 
-      {/* Tabs */}
-      <nav className="tabs">
-        <button
-          type="button"
-          className={`tab-btn ${activeTab === "targets" ? "active" : ""}`}
-          onClick={() => setActiveTab("targets")}
-        >
-          Targets ({targets.length})
-        </button>
-        <button
-          type="button"
-          className={`tab-btn ${activeTab === "jobs" ? "active" : ""}`}
-          onClick={() => setActiveTab("jobs")}
-        >
-          Jobs &amp; Artifacts ({jobs.length})
-        </button>
-        <button
-          type="button"
-          className={`tab-btn ${activeTab === "alerts" ? "active" : ""}`}
-          onClick={() => setActiveTab("alerts")}
-        >
-          Telegram Alerts ({alerts.length})
-        </button>
-      </nav>
+          {/* OVERVIEW & JOBS */}
+          {section === "overview" && (
+            <>
+              <section className="kpi-strip" aria-label="Key Metrics">
+                <div className="kpi-cell">
+                  <span className="kpi-label">Targets</span>
+                  <div className="kpi-row">
+                    <span className="kpi-value">{targets.length}</span>
+                    <span className="kpi-sub mono">AES-256-GCM</span>
+                  </div>
+                </div>
+                <div className="kpi-cell">
+                  <span className="kpi-label">Backup Jobs</span>
+                  <div className="kpi-row">
+                    <span className="kpi-value">{jobCounts.all}</span>
+                    <span className="kpi-sub mono">
+                      <span style={{ color: "var(--emerald)" }}>{jobCounts.succeeded} ok</span>
+                      {" · "}
+                      <span style={{ color: jobCounts.failed > 0 ? "var(--rose)" : "var(--text-muted)" }}>
+                        {jobCounts.failed} err
+                      </span>
+                    </span>
+                  </div>
+                </div>
+                <div className="kpi-cell">
+                  <span className="kpi-label">Restore Verification</span>
+                  <div className="kpi-row">
+                    <span className="kpi-value">
+                      {artifacts.length > 0 ? `${verificationMetrics.passRate}%` : "—"}
+                    </span>
+                    <span className="kpi-sub mono">
+                      {verificationMetrics.avgMs > 0 ? `avg ${verificationMetrics.avgMs}ms` : "no runs"}
+                    </span>
+                  </div>
+                </div>
+                <div className="kpi-cell">
+                  <span className="kpi-label">S3 Artifacts</span>
+                  <div className="kpi-row">
+                    <span className="kpi-value">{verificationMetrics.activeCount}</span>
+                    <span className="kpi-sub mono">{verificationMetrics.prunedCount} pruned</span>
+                  </div>
+                </div>
+              </section>
 
-      {/* Targets Tab */}
-      {activeTab === "targets" && (
-        <>
-          <section className="card">
-            <h2>Configured Backup Targets</h2>
-            {targets.length === 0 ? (
-              <div className="empty-state">
-                No backup targets configured yet. Create one below to get started.
+              <section className="panel">
+                <div className="panel-header">
+                  <div className="panel-title-group">
+                    <h1 className="panel-title">Backup Executions</h1>
+                    <span className="panel-subtitle">Click a row to inspect lease, verification, and error logs</span>
+                  </div>
+
+                  <div className="toolbar">
+                    <div className="segmented" role="tablist" aria-label="Filter jobs by status">
+                      {(
+                        [
+                          ["all", "All", jobCounts.all],
+                          ["succeeded", "Succeeded", jobCounts.succeeded],
+                          ["failed", "Failed", jobCounts.failed],
+                          ["queued", "Queued", jobCounts.queued + jobCounts.active],
+                        ] as const
+                      ).map(([key, label, count]) => (
+                        <button
+                          key={key}
+                          type="button"
+                          role="tab"
+                          aria-selected={jobStatusFilter === key}
+                          className={`seg-btn ${jobStatusFilter === key ? "active" : ""}`}
+                          onClick={() => setJobStatusFilter(key)}
+                        >
+                          {label}
+                          <span className="seg-count">{count}</span>
+                        </button>
+                      ))}
+                    </div>
+
+                    <select
+                      className="select-compact"
+                      aria-label="Filter by target"
+                      value={jobTargetFilter}
+                      onChange={(e) => setJobTargetFilter(e.target.value)}
+                    >
+                      <option value="all">All targets</option>
+                      {targets.map((t) => (
+                        <option key={t.id} value={String(t.id)}>
+                          {t.name}
+                        </option>
+                      ))}
+                    </select>
+
+                    <div className="search-box">
+                      <SearchIcon />
+                      <input
+                        className="search-input"
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        placeholder="Filter #id, target, key, error..."
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="table-wrap">
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>Job</th>
+                        <th>Target</th>
+                        <th>Status</th>
+                        <th>Restore Verify</th>
+                        <th>Attempts</th>
+                        <th>Size</th>
+                        <th>Run After / Created</th>
+                        <th>Diagnostics</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredJobs.length === 0 ? (
+                        <tr>
+                          <td colSpan={8} className="empty-cell">
+                            {jobs.length === 0
+                              ? "No backup executions yet. Add a target and click Backup Now."
+                              : "No jobs match the current filter."}
+                          </td>
+                        </tr>
+                      ) : (
+                        filteredJobs.map((j) => {
+                          const targetName =
+                            targetById.get(j.target_id)?.name ?? `target-#${j.target_id}`;
+                          return (
+                            <tr
+                              key={j.id}
+                              className={`clickable ${inspectedJobId === j.id ? "selected" : ""}`}
+                              onClick={() => setInspectedJobId(j.id)}
+                            >
+                              <td className="mono">#{j.id}</td>
+                              <td>
+                                <div className="cell-primary">{targetName}</div>
+                                {j.locked_by && (
+                                  <div className="cell-secondary mono">{j.locked_by}</div>
+                                )}
+                              </td>
+                              <td>{renderJobStatusBadge(j)}</td>
+                              <td>
+                                {j.artifact ? (
+                                  j.artifact.verification_passed ? (
+                                    <span className="badge badge-emerald">
+                                      Passed · {j.artifact.restore_duration_ms}ms
+                                    </span>
+                                  ) : (
+                                    <span className="badge badge-rose">Failed</span>
+                                  )
+                                ) : (
+                                  <span className="badge badge-neutral">Pending</span>
+                                )}
+                              </td>
+                              <td className="mono">
+                                {j.attempts}/{j.max_attempts}
+                              </td>
+                              <td className="mono">
+                                {j.artifact ? formatBytes(j.artifact.ciphertext_bytes) : "—"}
+                              </td>
+                              <td>
+                                <div className="mono">{formatRelativeTime(j.created_at)}</div>
+                                <div className="cell-secondary mono">
+                                  {formatTimestamp(j.run_after)}
+                                </div>
+                              </td>
+                              <td>
+                                {j.error_message ? (
+                                  <div
+                                    className="mono truncate"
+                                    style={{ color: "var(--rose)", maxWidth: 220 }}
+                                    title={j.error_message}
+                                  >
+                                    {j.error_message}
+                                  </div>
+                                ) : j.artifact?.object_key ? (
+                                  <div
+                                    className="mono truncate"
+                                    style={{ color: "var(--text-muted)", maxWidth: 220 }}
+                                    title={j.artifact.object_key}
+                                  >
+                                    {j.artifact.object_key}
+                                  </div>
+                                ) : (
+                                  <span style={{ color: "var(--text-muted)" }}>—</span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            </>
+          )}
+
+          {/* TARGETS */}
+          {section === "targets" && (
+            <section className="panel">
+              <div className="panel-header">
+                <div className="panel-title-group">
+                  <h1 className="panel-title">Backup Targets</h1>
+                  <span className="panel-subtitle mono">{targets.length} configured</span>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-primary btn-xs"
+                  onClick={openCreateTargetDrawer}
+                >
+                  <PlusIcon />
+                  New Target
+                </button>
               </div>
-            ) : (
+
               <div className="table-wrap">
-                <table>
+                <table className="data-table">
                   <thead>
                     <tr>
                       <th>Target</th>
                       <th>Storage Destination</th>
-                      <th>Sanity Query</th>
                       <th>Schedule</th>
-                      <th>Secrets</th>
-                      <th>Actions</th>
+                      <th>Retention Policy</th>
+                      <th>Sanity Query</th>
+                      <th>Credentials</th>
+                      <th style={{ textAlign: "right" }}>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {targets.map((t) => (
-                      <tr key={t.id}>
-                        <td>
-                          <strong>{t.name}</strong>
-                          <div className="mono" style={{ color: "var(--muted)" }}>
-                            ID #{t.id}
-                          </div>
-                        </td>
-                        <td>
-                          <div className="mono">
-                            s3://{t.storage_bucket} ({t.storage_region})
-                          </div>
-                          {t.storage_endpoint && (
-                            <div className="mono" style={{ color: "var(--muted)" }}>
-                              {t.storage_endpoint}
-                            </div>
-                          )}
-                        </td>
-                        <td className="mono">
-                          {t.sanity_query || <span style={{ color: "var(--muted)" }}>None</span>}
-                        </td>
-                        <td>
-                          <div>Every {t.interval_seconds}s</div>
-                          <div className="mono" style={{ color: "var(--muted)" }}>
-                            Keep: {t.retention_keep_last > 0 ? t.retention_keep_last : "∞"} · MaxAge:{" "}
-                            {t.retention_max_age_days > 0 ? `${t.retention_max_age_days}d` : "∞"}
-                          </div>
-                        </td>
-                        <td>
-                          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                            <span className="badge badge-success">
-                              DSN: {t.has_target_dsn ? "Encrypted" : "Missing"}
-                            </span>
-                            <span className="badge badge-muted">
-                              S3 Key: {t.has_storage_secret_key ? "Encrypted" : "Default Chain"}
-                            </span>
-                          </div>
-                        </td>
-                        <td>
-                          <div className="actions-cell">
-                            <button
-                              type="button"
-                              className="btn btn-primary btn-sm"
-                              onClick={() => void handleTriggerBackup(t)}
-                            >
-                              Backup Now
-                            </button>
-                            <button
-                              type="button"
-                              className="btn btn-danger btn-sm"
-                              onClick={() => void handleDeleteTarget(t)}
-                            >
-                              Delete
-                            </button>
-                          </div>
+                    {targets.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} className="empty-cell">
+                          No backup targets configured. Click &ldquo;New Target&rdquo; in the top bar to register a PostgreSQL database.
                         </td>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-
-          <section className="card">
-            <h2>Add New Backup Target</h2>
-            <form className="form-grid" onSubmit={handleCreateTarget}>
-              <div className="field">
-                <label htmlFor="target-name">Target Name</label>
-                <input
-                  id="target-name"
-                  type="text"
-                  value={targetName}
-                  onChange={(e) => setTargetName(e.target.value)}
-                  placeholder="customer-app-prod"
-                  required
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="target-dsn">Target PostgreSQL DSN (encrypted at rest)</label>
-                <input
-                  id="target-dsn"
-                  type="password"
-                  value={targetDSN}
-                  onChange={(e) => setTargetDSN(e.target.value)}
-                  placeholder="postgres://user:pass@host:5432/dbname?sslmode=require"
-                  required
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="storage-endpoint">S3 / R2 Endpoint URL (optional)</label>
-                <input
-                  id="storage-endpoint"
-                  type="text"
-                  value={storageEndpoint}
-                  onChange={(e) => setStorageEndpoint(e.target.value)}
-                  placeholder="https://<account>.r2.cloudflarestorage.com or http://10.0.0.5:4566"
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="storage-region">Storage Region</label>
-                <input
-                  id="storage-region"
-                  type="text"
-                  value={storageRegion}
-                  onChange={(e) => setStorageRegion(e.target.value)}
-                  placeholder="us-east-1"
-                  required
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="storage-bucket">S3 / R2 Bucket</label>
-                <input
-                  id="storage-bucket"
-                  type="text"
-                  value={storageBucket}
-                  onChange={(e) => setStorageBucket(e.target.value)}
-                  placeholder="pgvault-backups"
-                  required
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="storage-access-key">Access Key ID</label>
-                <input
-                  id="storage-access-key"
-                  type="text"
-                  value={storageAccessKey}
-                  onChange={(e) => setStorageAccessKey(e.target.value)}
-                  placeholder="test"
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="storage-secret-key">Secret Access Key (encrypted at rest)</label>
-                <input
-                  id="storage-secret-key"
-                  type="password"
-                  value={storageSecretKey}
-                  onChange={(e) => setStorageSecretKey(e.target.value)}
-                  placeholder="••••••••"
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="interval-seconds">Interval (seconds)</label>
-                <input
-                  id="interval-seconds"
-                  type="number"
-                  min={60}
-                  value={intervalSeconds}
-                  onChange={(e) => setIntervalSeconds(Number(e.target.value))}
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="retention-keep-last">Retention: Keep Last (0 = off)</label>
-                <input
-                  id="retention-keep-last"
-                  type="number"
-                  min={0}
-                  value={retentionKeepLast}
-                  onChange={(e) => setRetentionKeepLast(Number(e.target.value))}
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="retention-max-age-days">Retention: Max Age Days (0 = off)</label>
-                <input
-                  id="retention-max-age-days"
-                  type="number"
-                  min={0}
-                  value={retentionMaxAgeDays}
-                  onChange={(e) => setRetentionMaxAgeDays(Number(e.target.value))}
-                />
-              </div>
-              <div className="field full">
-                <label htmlFor="sanity-query">
-                  Read-Only Sanity Query (optional, SELECT/WITH only)
-                </label>
-                <input
-                  id="sanity-query"
-                  type="text"
-                  value={sanityQuery}
-                  onChange={(e) => setSanityQuery(e.target.value)}
-                  placeholder="SELECT count(*) FROM public.users"
-                />
-              </div>
-              <div className="field full">
-                <div className="checkbox-row">
-                  <label className="checkbox-label">
-                    <input
-                      type="checkbox"
-                      checked={forcePathStyle}
-                      onChange={(e) => setForcePathStyle(e.target.checked)}
-                    />
-                    Force Path Style (required for LocalStack / MinIO)
-                  </label>
-                  <button
-                    type="submit"
-                    className="btn btn-primary"
-                    disabled={submittingTarget}
-                  >
-                    {submittingTarget ? "Creating..." : "Create Target"}
-                  </button>
-                </div>
-              </div>
-            </form>
-          </section>
-        </>
-      )}
-
-      {/* Jobs & Artifacts Tab */}
-      {activeTab === "jobs" && (
-        <>
-          <section className="card">
-            <h2>Backup Jobs</h2>
-            {jobs.length === 0 ? (
-              <div className="empty-state">
-                No backup jobs yet. Trigger a backup from the Targets tab.
-              </div>
-            ) : (
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Job</th>
-                      <th>Target</th>
-                      <th>Status</th>
-                      <th>Restore Verification</th>
-                      <th>Attempts</th>
-                      <th>Created / Error</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {jobs.map((j) => (
-                      <tr key={j.id}>
-                        <td className="mono">#{j.id}</td>
-                        <td>{targetNameById.get(j.target_id) ?? `Target #${j.target_id}`}</td>
-                        <td>
-                          <span className={jobStatusBadge(j.status)}>{j.status}</span>
-                        </td>
-                        <td>
-                          {j.artifact ? (
-                            j.artifact.verification_passed ? (
-                              <span className="badge badge-success">
-                                Passed ({j.artifact.restore_duration_ms} ms)
-                              </span>
-                            ) : (
-                              <span className="badge badge-danger">
-                                Failed
-                                {j.artifact.restore_duration_ms > 0
-                                  ? ` (${j.artifact.restore_duration_ms} ms)`
-                                  : ""}
-                              </span>
-                            )
-                          ) : (
-                            <span className="badge badge-muted">Pending</span>
-                          )}
-                        </td>
-                        <td className="mono">
-                          {j.attempts}/{j.max_attempts}
-                        </td>
-                        <td>
-                          <div className="mono" style={{ color: "var(--muted)" }}>
-                            {new Date(j.created_at).toLocaleString()}
-                          </div>
-                          {j.error_message && (
-                            <div style={{ color: "#fca5a5", marginTop: 4 }}>
-                              {j.error_message}
+                    ) : (
+                      targets.map((t) => (
+                        <tr key={t.id}>
+                          <td>
+                            <div className="cell-primary">{t.name}</div>
+                            <div className="cell-secondary mono">id:{t.id}</div>
+                          </td>
+                          <td>
+                            <div className="mono">
+                              s3://{t.storage_bucket}{" "}
+                              <span style={{ color: "var(--text-muted)" }}>({t.storage_region})</span>
                             </div>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-
-          <section className="card">
-            <h2>Encrypted Backup Artifacts</h2>
-            {artifacts.length === 0 ? (
-              <div className="empty-state">No encrypted backup artifacts recorded yet.</div>
-            ) : (
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Artifact / Object Key</th>
-                      <th>PG</th>
-                      <th>Size (Plain / Cipher)</th>
-                      <th>Tables</th>
-                      <th>Verification</th>
-                      <th>SHA-256</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {artifacts.map((a) => (
-                      <tr key={a.id}>
-                        <td>
-                          <div className="mono">{a.object_key}</div>
-                          <div className="mono" style={{ color: "var(--muted)" }}>
-                            Job #{a.job_id} ·{" "}
-                            {targetNameById.get(a.target_id) ?? `Target #${a.target_id}`}
-                          </div>
-                        </td>
-                        <td className="mono">v{a.pg_major_version}</td>
-                        <td className="mono">
-                          {formatBytes(a.plaintext_bytes)} / {formatBytes(a.ciphertext_bytes)}
-                        </td>
-                        <td className="mono">{a.tables.length}</td>
-                        <td>
-                          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                            {a.verification_passed ? (
-                              <span className="badge badge-success">
-                                Passed · {a.restore_duration_ms} ms
+                            <div className="cell-secondary mono">
+                              {t.storage_endpoint || "AWS S3 default endpoint"}
+                            </div>
+                          </td>
+                          <td>
+                            <div className="mono">every {formatInterval(t.interval_seconds)}</div>
+                            <div className="cell-secondary mono">
+                              last: {formatRelativeTime(t.last_scheduled_at)}
+                            </div>
+                          </td>
+                          <td className="mono">
+                            <div>
+                              keep_last:{" "}
+                              <span style={{ color: t.retention_keep_last > 0 ? "var(--text)" : "var(--text-muted)" }}>
+                                {t.retention_keep_last > 0 ? t.retention_keep_last : "off"}
                               </span>
+                            </div>
+                            <div className="cell-secondary">
+                              max_age:{" "}
+                              <span style={{ color: t.retention_max_age_days > 0 ? "var(--text-secondary)" : "var(--text-muted)" }}>
+                                {t.retention_max_age_days > 0 ? `${t.retention_max_age_days}d` : "off"}
+                              </span>
+                            </div>
+                          </td>
+                          <td>
+                            {t.sanity_query ? (
+                              <div className="mono truncate" style={{ maxWidth: 200 }} title={t.sanity_query}>
+                                {t.sanity_query}
+                              </div>
                             ) : (
-                              <span className="badge badge-danger">Failed</span>
+                              <span style={{ color: "var(--text-muted)" }}>—</span>
                             )}
-                            {a.pruned_at && (
-                              <span
-                                className="badge badge-muted"
-                                title={`Pruned at ${new Date(a.pruned_at).toLocaleString()}`}
+                          </td>
+                          <td>
+                            <div className="actions-inline">
+                              <span className="badge badge-emerald">
+                                DSN {t.has_target_dsn ? "enc" : "missing"}
+                              </span>
+                              <span className="badge badge-neutral">
+                                S3 {t.has_storage_secret_key ? "enc" : "IAM"}
+                              </span>
+                            </div>
+                          </td>
+                          <td style={{ textAlign: "right" }}>
+                            <div className="actions-inline">
+                              <button
+                                type="button"
+                                className="btn btn-primary btn-xs"
+                                onClick={() => void handleTriggerBackup(t)}
                               >
-                                Pruned
-                              </span>
-                            )}
-                          </div>
-                          {!a.verification_passed && a.verification_error && (
-                            <div style={{ color: "#fca5a5", marginTop: 4, fontSize: "0.78rem" }}>
-                              {a.verification_error}
+                                <PlayIcon />
+                                Backup Now
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-xs"
+                                onClick={() => openEditTargetDrawer(t)}
+                              >
+                                Edit
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-danger btn-xs"
+                                onClick={() => void handleDeleteTarget(t)}
+                              >
+                                Delete
+                              </button>
                             </div>
-                          )}
-                        </td>
-                        <td className="mono" title={a.ciphertext_sha256}>
-                          {a.ciphertext_sha256.slice(0, 12)}…
-                        </td>
-                      </tr>
-                    ))}
+                          </td>
+                        </tr>
+                      ))
+                    )}
                   </tbody>
                 </table>
               </div>
-            )}
-          </section>
-        </>
-      )}
+            </section>
+          )}
 
-      {/* Telegram Alerts Tab */}
-      {activeTab === "alerts" && (
-        <>
-          <section className="card">
-            <h2>Configured Alert Channels</h2>
-            {alerts.length === 0 ? (
-              <div className="empty-state">No Telegram alert channels configured yet.</div>
-            ) : (
+          {/* ARTIFACTS */}
+          {section === "artifacts" && (
+            <section className="panel">
+              <div className="panel-header">
+                <div className="panel-title-group">
+                  <h1 className="panel-title">Encrypted Backup Artifacts</h1>
+                  <span className="panel-subtitle mono">
+                    {verificationMetrics.activeCount} active · {verificationMetrics.prunedCount} pruned
+                  </span>
+                </div>
+
+                <div className="toolbar">
+                  <select
+                    className="select-compact"
+                    aria-label="Filter artifacts by target"
+                    value={jobTargetFilter}
+                    onChange={(e) => setJobTargetFilter(e.target.value)}
+                  >
+                    <option value="all">All targets</option>
+                    {targets.map((t) => (
+                      <option key={t.id} value={String(t.id)}>
+                        {t.name}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="search-box">
+                    <SearchIcon />
+                    <input
+                      className="search-input"
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="Filter key, sha256, job..."
+                    />
+                  </div>
+                </div>
+              </div>
+
               <div className="table-wrap">
-                <table>
+                <table className="data-table">
                   <thead>
                     <tr>
-                      <th>Scope</th>
-                      <th>Channel</th>
-                      <th>Chat ID</th>
-                      <th>Triggers</th>
-                      <th>Status</th>
+                      <th>Object Key</th>
+                      <th>Target / Job</th>
+                      <th>PG</th>
+                      <th>Plain / Cipher</th>
+                      <th>SHA-256</th>
+                      <th>Restore Verification</th>
+                      <th>Lifecycle</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {alerts.map((ch) => (
-                      <tr key={ch.id}>
-                        <td>
-                          {ch.target_id === null
-                            ? "Global (all targets)"
-                            : targetNameById.get(ch.target_id) ?? `Target #${ch.target_id}`}
-                        </td>
-                        <td>
-                          <span className="badge badge-info">{ch.channel_type}</span>{" "}
-                          <span className="badge badge-success">
-                            Token: {ch.has_bot_token ? "Encrypted" : "Missing"}
-                          </span>
-                        </td>
-                        <td className="mono">{ch.chat_id}</td>
-                        <td>
-                          {ch.notify_on_failure && (
-                            <span className="badge badge-danger" style={{ marginRight: 6 }}>
-                              On Failure
-                            </span>
-                          )}
-                          {ch.notify_on_success && (
-                            <span className="badge badge-success">On Success</span>
-                          )}
-                        </td>
-                        <td>
-                          <span
-                            className={`badge ${ch.enabled ? "badge-success" : "badge-muted"}`}
-                          >
-                            {ch.enabled ? "Enabled" : "Disabled"}
-                          </span>
+                    {filteredArtifacts.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} className="empty-cell">
+                          No backup artifacts recorded yet.
                         </td>
                       </tr>
-                    ))}
+                    ) : (
+                      filteredArtifacts.map((a) => {
+                        const targetName =
+                          targetById.get(a.target_id)?.name ?? `target-#${a.target_id}`;
+                        return (
+                          <tr key={a.id}>
+                            <td>
+                              <div className="mono truncate" style={{ maxWidth: 260 }} title={a.object_key}>
+                                {a.object_key}
+                              </div>
+                              <div className="cell-secondary mono">
+                                {formatTimestamp(a.created_at)}
+                              </div>
+                            </td>
+                            <td>
+                              <div className="cell-primary">{targetName}</div>
+                              <div className="cell-secondary mono">
+                                job #{a.job_id} · {a.tables.length} tables
+                              </div>
+                            </td>
+                            <td className="mono">v{a.pg_major_version}</td>
+                            <td className="mono">
+                              <div>{formatBytes(a.plaintext_bytes)}</div>
+                              <div className="cell-secondary">{formatBytes(a.ciphertext_bytes)}</div>
+                            </td>
+                            <td>
+                              <div className="actions-inline">
+                                <span className="mono" title={a.ciphertext_sha256}>
+                                  {a.ciphertext_sha256.slice(0, 12)}
+                                </span>
+                                <button
+                                  type="button"
+                                  className="btn btn-ghost btn-icon"
+                                  style={{ height: 22, width: 22 }}
+                                  onClick={() => void copyHash(a)}
+                                  title="Copy full SHA-256"
+                                  aria-label="Copy SHA-256"
+                                >
+                                  {copiedHashId === a.id ? <CheckIcon /> : <CopyIcon />}
+                                </button>
+                              </div>
+                            </td>
+                            <td>
+                              {a.verification_passed ? (
+                                <span className="badge badge-emerald">
+                                  Passed · {a.restore_duration_ms}ms
+                                </span>
+                              ) : (
+                                <span className="badge badge-rose" title={a.verification_error}>
+                                  Failed
+                                </span>
+                              )}
+                            </td>
+                            <td>
+                              {a.pruned_at ? (
+                                <span
+                                  className="badge badge-neutral"
+                                  title={`Pruned at ${formatTimestamp(a.pruned_at)}`}
+                                >
+                                  Pruned
+                                </span>
+                              ) : (
+                                <span className="badge badge-emerald">Stored</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
                   </tbody>
                 </table>
               </div>
-            )}
-          </section>
+            </section>
+          )}
 
-          <section className="card">
-            <h2>Configure Telegram Alert</h2>
-            <form className="form-grid" onSubmit={handleSaveTelegramAlert}>
-              <div className="field">
-                <label htmlFor="alert-scope">Scope</label>
-                <select
-                  id="alert-scope"
-                  value={alertTargetId}
-                  onChange={(e) => setAlertTargetId(e.target.value)}
-                >
-                  <option value="global">Global (All Targets)</option>
-                  {targets.map((t) => (
-                    <option key={t.id} value={String(t.id)}>
-                      {t.name} (#{t.id})
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="field">
-                <label htmlFor="tg-chat-id">Telegram Chat ID</label>
-                <input
-                  id="tg-chat-id"
-                  type="text"
-                  value={telegramChatId}
-                  onChange={(e) => setTelegramChatId(e.target.value)}
-                  placeholder="-1001234567890"
-                  required
-                />
-              </div>
-              <div className="field full">
-                <label htmlFor="tg-bot-token">
-                  Telegram Bot Token (encrypted at rest; leave blank when updating existing channel)
-                </label>
-                <input
-                  id="tg-bot-token"
-                  type="password"
-                  value={telegramBotToken}
-                  onChange={(e) => setTelegramBotToken(e.target.value)}
-                  placeholder="123456789:AA..."
-                />
-              </div>
-              <div className="field full">
-                <div className="checkbox-row">
-                  <label className="checkbox-label">
-                    <input
-                      type="checkbox"
-                      checked={notifyOnFailure}
-                      onChange={(e) => setNotifyOnFailure(e.target.checked)}
-                    />
-                    Notify on Failure
-                  </label>
-                  <label className="checkbox-label">
-                    <input
-                      type="checkbox"
-                      checked={notifyOnSuccess}
-                      onChange={(e) => setNotifyOnSuccess(e.target.checked)}
-                    />
-                    Notify on Success
-                  </label>
-                  <label className="checkbox-label">
-                    <input
-                      type="checkbox"
-                      checked={alertEnabled}
-                      onChange={(e) => setAlertEnabled(e.target.checked)}
-                    />
-                    Enabled
-                  </label>
-                  <button
-                    type="submit"
-                    className="btn btn-primary"
-                    disabled={submittingAlert}
-                  >
-                    {submittingAlert ? "Saving..." : "Save Telegram Alert"}
-                  </button>
+          {/* ALERTS */}
+          {section === "alerts" && (
+            <div className="alerts-grid">
+              <section className="panel">
+                <div className="panel-header">
+                  <div className="panel-title-group">
+                    <h1 className="panel-title">Alert Channels</h1>
+                    <span className="panel-subtitle mono">{alerts.length} configured</span>
+                  </div>
                 </div>
-              </div>
-            </form>
-          </section>
-        </>
-      )}
-    </main>
+                <div className="table-wrap">
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>Scope</th>
+                        <th>Chat ID</th>
+                        <th>Triggers</th>
+                        <th>Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {alerts.length === 0 ? (
+                        <tr>
+                          <td colSpan={4} className="empty-cell">
+                            No Telegram alert channels configured.
+                          </td>
+                        </tr>
+                      ) : (
+                        alerts.map((ch) => (
+                          <tr key={ch.id}>
+                            <td>
+                              <div className="cell-primary">
+                                {ch.target_id === null
+                                  ? "Global (all targets)"
+                                  : targetById.get(ch.target_id)?.name ?? `target-#${ch.target_id}`}
+                              </div>
+                              <div className="cell-secondary mono">
+                                {ch.channel_type} · token {ch.has_bot_token ? "enc" : "missing"}
+                              </div>
+                            </td>
+                            <td className="mono">{ch.chat_id}</td>
+                            <td>
+                              <div className="actions-inline">
+                                {ch.notify_on_failure && (
+                                  <span className="badge badge-rose">failure</span>
+                                )}
+                                {ch.notify_on_success && (
+                                  <span className="badge badge-emerald">success</span>
+                                )}
+                              </div>
+                            </td>
+                            <td>
+                              <span
+                                className={`badge ${
+                                  ch.enabled ? "badge-emerald" : "badge-neutral"
+                                }`}
+                              >
+                                {ch.enabled ? "enabled" : "disabled"}
+                              </span>
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section className="panel">
+                <div className="panel-header">
+                  <h2 className="panel-title">Configure Telegram Channel</h2>
+                </div>
+                <form className="popover-body" onSubmit={(e) => void handleSaveAlert(e)}>
+                  <div className="field">
+                    <label htmlFor="al-scope">Scope</label>
+                    <select
+                      id="al-scope"
+                      className="select"
+                      value={alertTargetId}
+                      onChange={(e) => setAlertTargetId(e.target.value)}
+                    >
+                      <option value="global">Global (All Targets)</option>
+                      {targets.map((t) => (
+                        <option key={t.id} value={String(t.id)}>
+                          {t.name} (#{t.id})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="field">
+                    <label htmlFor="al-chat">Telegram Chat ID</label>
+                    <input
+                      id="al-chat"
+                      className="input mono"
+                      type="text"
+                      value={telegramChatId}
+                      onChange={(e) => setTelegramChatId(e.target.value)}
+                      placeholder="-1001234567890"
+                      required
+                    />
+                  </div>
+
+                  <div className="field">
+                    <label htmlFor="al-token">Bot Token</label>
+                    <input
+                      id="al-token"
+                      className="input mono"
+                      type="password"
+                      value={telegramBotToken}
+                      onChange={(e) => setTelegramBotToken(e.target.value)}
+                      placeholder="123456789:AA... (blank keeps existing)"
+                    />
+                    <span className="field-hint">
+                      Stored encrypted with KEK; never returned in API responses.
+                    </span>
+                  </div>
+
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <label className="checkbox-line">
+                      <input
+                        type="checkbox"
+                        checked={notifyOnFailure}
+                        onChange={(e) => setNotifyOnFailure(e.target.checked)}
+                      />
+                      Notify on backup or verification failure
+                    </label>
+                    <label className="checkbox-line">
+                      <input
+                        type="checkbox"
+                        checked={notifyOnSuccess}
+                        onChange={(e) => setNotifyOnSuccess(e.target.checked)}
+                      />
+                      Notify on verified success
+                    </label>
+                    <label className="checkbox-line">
+                      <input
+                        type="checkbox"
+                        checked={alertEnabled}
+                        onChange={(e) => setAlertEnabled(e.target.checked)}
+                      />
+                      Channel enabled
+                    </label>
+                  </div>
+
+                  <div style={{ display: "flex", justifyContent: "flex-end", paddingTop: 4 }}>
+                    <button type="submit" className="btn btn-primary" disabled={savingAlert}>
+                      {savingAlert ? "Saving..." : "Save Telegram Alert"}
+                    </button>
+                  </div>
+                </form>
+              </section>
+            </div>
+          )}
+        </main>
+      </div>
+
+      {/* Connection Settings Popover */}
+      <ConnectionPopover
+        open={connOpen}
+        baseUrl={apiCfg.baseUrl}
+        apiKey={apiKey}
+        defaultBaseUrl={defaultUrl}
+        onClose={() => setConnOpen(false)}
+        onSave={handleSaveConnection}
+        onReset={handleResetConnection}
+      />
+
+      {/* Target Create/Edit Slide-Over Drawer */}
+      <TargetDrawer
+        open={targetDrawerOpen}
+        editingTarget={editingTarget}
+        submitting={savingTarget}
+        onClose={() => {
+          setTargetDrawerOpen(false);
+          setEditingTarget(null);
+        }}
+        onCreate={handleCreateTarget}
+        onUpdate={handleUpdateTarget}
+      />
+
+      {/* Execution Detail Inspector Drawer */}
+      <JobInspectorDrawer
+        job={inspectedJob}
+        targetName={
+          inspectedJob
+            ? targetById.get(inspectedJob.target_id)?.name ?? `target-#${inspectedJob.target_id}`
+            : ""
+        }
+        onClose={() => setInspectedJobId(null)}
+      />
+    </div>
   );
 }

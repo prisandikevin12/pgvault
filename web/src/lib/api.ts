@@ -39,6 +39,21 @@ export interface CreateTargetInput {
   retention_max_age_days: number;
 }
 
+export interface UpdateTargetInput {
+  name?: string;
+  target_dsn?: string;
+  storage_endpoint?: string;
+  storage_region?: string;
+  storage_bucket?: string;
+  storage_access_key?: string;
+  storage_secret_key?: string;
+  storage_force_path_style?: boolean;
+  sanity_query?: string;
+  interval_seconds?: number;
+  retention_keep_last?: number;
+  retention_max_age_days?: number;
+}
+
 export interface Artifact {
   id: number;
   job_id: number;
@@ -65,6 +80,7 @@ export interface Job {
   run_after: string;
   locked_at?: string;
   locked_by?: string;
+  lease_expires_at?: string;
   started_at?: string;
   finished_at?: string;
   error_message?: string;
@@ -97,6 +113,11 @@ export interface UpsertTelegramAlertInput {
 export interface APIConfig {
   baseUrl: string;
   apiKey: string;
+}
+
+export interface HealthStatus {
+  ok: boolean;
+  latencyMs: number;
 }
 
 export function resolveDefaultApiBaseUrl(): string {
@@ -158,11 +179,21 @@ async function request<T>(
 }
 
 export async function checkHealth(cfg: APIConfig): Promise<boolean> {
+  const res = await checkHealthWithLatency(cfg);
+  return res.ok;
+}
+
+export async function checkHealthWithLatency(cfg: APIConfig): Promise<HealthStatus> {
+  const start = typeof performance !== "undefined" ? performance.now() : Date.now();
   try {
     const res = await request<{ status: string }>(cfg, "/healthz");
-    return res.status === "ok";
+    const elapsed = Math.max(
+      1,
+      Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - start)
+    );
+    return { ok: res.status === "ok", latencyMs: elapsed };
   } catch {
-    return false;
+    return { ok: false, latencyMs: 0 };
   }
 }
 
@@ -181,6 +212,17 @@ export async function createTarget(
   });
 }
 
+export async function updateTarget(
+  cfg: APIConfig,
+  id: number,
+  input: UpdateTargetInput
+): Promise<Target> {
+  return request<Target>(cfg, `/api/v1/targets/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
 export async function deleteTarget(cfg: APIConfig, id: number): Promise<void> {
   await request<void>(cfg, `/api/v1/targets/${id}`, { method: "DELETE" });
 }
@@ -193,14 +235,14 @@ export async function triggerBackup(cfg: APIConfig, targetId: number): Promise<J
 }
 
 export async function listJobs(cfg: APIConfig): Promise<Job[]> {
-  const res = await request<{ jobs: Job[] }>(cfg, "/api/v1/jobs?limit=50");
+  const res = await request<{ jobs: Job[] }>(cfg, "/api/v1/jobs?limit=100");
   return res.jobs ?? [];
 }
 
 export async function listArtifacts(cfg: APIConfig): Promise<Artifact[]> {
   const res = await request<{ artifacts: Artifact[] }>(
     cfg,
-    "/api/v1/artifacts?limit=50"
+    "/api/v1/artifacts?limit=100"
   );
   return res.artifacts ?? [];
 }
@@ -230,4 +272,33 @@ export function formatBytes(bytes: number): string {
     idx++;
   }
   return `${value.toFixed(1)} ${units[idx]}`;
+}
+
+export function formatInterval(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600 && seconds % 60 === 0) return `${seconds / 60}m`;
+  if (seconds < 86400 && seconds % 3600 === 0) return `${seconds / 3600}h`;
+  if (seconds % 86400 === 0) return `${seconds / 86400}d`;
+  return `${seconds}s`;
+}
+
+export function formatTimestamp(ts?: string): string {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return ts;
+  return d.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
+}
+
+export function formatRelativeTime(ts?: string): string {
+  if (!ts) return "never";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return ts;
+  const diffSec = Math.round((Date.now() - d.getTime()) / 1000);
+  if (Math.abs(diffSec) < 5) return "just now";
+  const abs = Math.abs(diffSec);
+  const suffix = diffSec >= 0 ? "ago" : "from now";
+  if (abs < 60) return `${abs}s ${suffix}`;
+  if (abs < 3600) return `${Math.floor(abs / 60)}m ${suffix}`;
+  if (abs < 86400) return `${Math.floor(abs / 3600)}h ${suffix}`;
+  return `${Math.floor(abs / 86400)}d ${suffix}`;
 }

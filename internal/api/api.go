@@ -293,19 +293,20 @@ type ArtifactResponse struct {
 }
 
 type JobResponse struct {
-	ID           int64             `json:"id"`
-	TargetID     int64             `json:"target_id"`
-	Status       string            `json:"status"`
-	Attempts     int               `json:"attempts"`
-	MaxAttempts  int               `json:"max_attempts"`
-	RunAfter     time.Time         `json:"run_after"`
-	LockedAt     *time.Time        `json:"locked_at,omitempty"`
-	LockedBy     string            `json:"locked_by,omitempty"`
-	StartedAt    *time.Time        `json:"started_at,omitempty"`
-	FinishedAt   *time.Time        `json:"finished_at,omitempty"`
-	ErrorMessage string            `json:"error_message,omitempty"`
-	CreatedAt    time.Time         `json:"created_at"`
-	Artifact     *ArtifactResponse `json:"artifact,omitempty"`
+	ID             int64             `json:"id"`
+	TargetID       int64             `json:"target_id"`
+	Status         string            `json:"status"`
+	Attempts       int               `json:"attempts"`
+	MaxAttempts    int               `json:"max_attempts"`
+	RunAfter       time.Time         `json:"run_after"`
+	LockedAt       *time.Time        `json:"locked_at,omitempty"`
+	LockedBy       string            `json:"locked_by,omitempty"`
+	LeaseExpiresAt *time.Time        `json:"lease_expires_at,omitempty"`
+	StartedAt      *time.Time        `json:"started_at,omitempty"`
+	FinishedAt     *time.Time        `json:"finished_at,omitempty"`
+	ErrorMessage   string            `json:"error_message,omitempty"`
+	CreatedAt      time.Time         `json:"created_at"`
+	Artifact       *ArtifactResponse `json:"artifact,omitempty"`
 }
 
 type AlertChannelResponse struct {
@@ -368,18 +369,19 @@ func toArtifactResponse(a db.BackupArtifact) ArtifactResponse {
 
 func toJobResponse(j queue.Job, art *db.BackupArtifact) JobResponse {
 	resp := JobResponse{
-		ID:           j.ID,
-		TargetID:     j.TargetID,
-		Status:       j.Status,
-		Attempts:     j.Attempts,
-		MaxAttempts:  j.MaxAttempts,
-		RunAfter:     j.RunAfter,
-		LockedAt:     j.LockedAt,
-		LockedBy:     j.LockedBy,
-		StartedAt:    j.StartedAt,
-		FinishedAt:   j.FinishedAt,
-		ErrorMessage: j.ErrorMessage,
-		CreatedAt:    j.CreatedAt,
+		ID:             j.ID,
+		TargetID:       j.TargetID,
+		Status:         j.Status,
+		Attempts:       j.Attempts,
+		MaxAttempts:    j.MaxAttempts,
+		RunAfter:       j.RunAfter,
+		LockedAt:       j.LockedAt,
+		LockedBy:       j.LockedBy,
+		LeaseExpiresAt: j.LeaseExpiresAt,
+		StartedAt:      j.StartedAt,
+		FinishedAt:     j.FinishedAt,
+		ErrorMessage:   j.ErrorMessage,
+		CreatedAt:      j.CreatedAt,
 	}
 	if art != nil {
 		a := toArtifactResponse(*art)
