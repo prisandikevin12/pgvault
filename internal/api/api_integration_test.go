@@ -18,6 +18,7 @@ import (
 	"github.com/prisandikevin12/pgvault/internal/db"
 	"github.com/prisandikevin12/pgvault/internal/pgdump"
 	"github.com/prisandikevin12/pgvault/internal/queue"
+	"github.com/prisandikevin12/pgvault/internal/storage"
 )
 
 func testAppDBDSN() string {
@@ -267,5 +268,188 @@ func TestAPI_Integration_FullLifecycle(t *testing.T) {
 	resp, _ = doReq(http.MethodGet, fmt.Sprintf("/api/v1/targets/%d", createdTarget.ID), nil, true)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("GET deleted target status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestAPI_Integration_TestConnectionAndArtifactDownload(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool, err := db.ConnectPool(ctx, testAppDBDSN())
+	if err != nil {
+		t.Fatalf("ConnectPool() error: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	if err := db.ApplyMigrations(ctx, pool); err != nil {
+		t.Fatalf("ApplyMigrations() error: %v", err)
+	}
+
+	targetDSN := os.Getenv("PGVAULT_TEST_TARGET_DSN")
+	if targetDSN == "" {
+		targetDSN = "postgres://target_admin:target_dev_password@127.0.0.1:5433/customer_app?sslmode=disable"
+	}
+	s3Endpoint := os.Getenv("PGVAULT_TEST_S3_ENDPOINT")
+	if s3Endpoint == "" {
+		s3Endpoint = "http://127.0.0.1:4566"
+	}
+
+	kek, _ := crypto.GenerateDEK()
+	const apiKey = "int-turnkey-key"
+	srv, err := NewServer(pool, Config{KEK: kek, APIKey: apiKey})
+	if err != nil {
+		t.Fatalf("NewServer() error: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	doReq := func(method, path string, payload any) (*http.Response, []byte) {
+		t.Helper()
+		var body *bytes.Reader
+		if payload != nil {
+			b, _ := json.Marshal(payload)
+			body = bytes.NewReader(b)
+		} else {
+			body = bytes.NewReader(nil)
+		}
+		req, _ := http.NewRequestWithContext(ctx, method, ts.URL+path, body)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		if payload != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s error: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(resp.Body)
+		return resp, buf.Bytes()
+	}
+
+	// 1. Test connection with valid live target-db DSN
+	resp, raw := doReq(http.MethodPost, "/api/v1/targets/test-connection", TestConnectionRequest{
+		DSN: targetDSN,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("test-connection(valid) status = %d, want 200 (body=%s)", resp.StatusCode, string(raw))
+	}
+	var tcResp TestConnectionResponse
+	_ = json.Unmarshal(raw, &tcResp)
+	if !tcResp.OK || tcResp.ServerVersion == "" {
+		t.Fatalf("unexpected test-connection response: %+v", tcResp)
+	}
+
+	// 2. Test connection with wrong password -> 502 and password never leaked
+	resp, raw = doReq(http.MethodPost, "/api/v1/targets/test-connection", TestConnectionRequest{
+		DSN: "postgres://target_admin:WRONG_SUPER_SECRET_PW@127.0.0.1:5433/customer_app?sslmode=disable",
+	})
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("test-connection(wrong pw) status = %d, want 502 (body=%s)", resp.StatusCode, string(raw))
+	}
+	if strings.Contains(string(raw), "WRONG_SUPER_SECRET_PW") {
+		t.Fatalf("SECURITY VIOLATION: test-connection leaked password: %s", string(raw))
+	}
+
+	// 3. Upload an encrypted artifact to LocalStack S3 and test /download, /decrypt, and pruned 410
+	bucket := fmt.Sprintf("pgvault-dl-int-%d", time.Now().UnixNano())
+	s3Client, err := storage.NewClient(ctx, storage.Config{
+		EndpointURL:     s3Endpoint,
+		Region:          "us-east-1",
+		Bucket:          bucket,
+		AccessKeyID:     "test",
+		SecretAccessKey: "test",
+		ForcePathStyle:  true,
+	})
+	if err != nil {
+		t.Fatalf("storage.NewClient() error: %v", err)
+	}
+	if err := s3Client.EnsureBucket(ctx); err != nil {
+		t.Fatalf("EnsureBucket() error: %v", err)
+	}
+
+	dek, _ := crypto.GenerateDEK()
+	wrappedDEK, _ := crypto.WrapDEK(kek, dek)
+	plaintext := []byte("PGDMP_INTEGRATION_DOWNLOAD_AND_DECRYPT_TEST_PAYLOAD")
+	var encBuf bytes.Buffer
+	stats, err := crypto.EncryptStream(bytes.NewReader(plaintext), &encBuf, dek, 1024)
+	if err != nil {
+		t.Fatalf("EncryptStream() error: %v", err)
+	}
+	objectKey := "backups/dl-test.pgv1"
+	if _, err := s3Client.UploadStream(ctx, objectKey, bytes.NewReader(encBuf.Bytes()), "application/octet-stream"); err != nil {
+		t.Fatalf("UploadStream() error: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanCancel()
+		_ = s3Client.DeleteObject(cleanCtx, objectKey)
+	})
+
+	protectedDSN, _ := db.ProtectSecret(kek, targetDSN)
+	protectedSecret, _ := db.ProtectSecret(kek, "test")
+	target, err := db.CreateTarget(ctx, pool, db.BackupTarget{
+		Name:                  fmt.Sprintf("api-dl-target-%d", time.Now().UnixNano()),
+		TargetDSN:             protectedDSN,
+		StorageEndpoint:       s3Endpoint,
+		StorageRegion:         "us-east-1",
+		StorageBucket:         bucket,
+		StorageAccessKey:      "test",
+		StorageSecretKey:      protectedSecret,
+		StorageForcePathStyle: true,
+		IntervalSeconds:       3600,
+	})
+	if err != nil {
+		t.Fatalf("CreateTarget() error: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanCancel()
+		_, _ = pool.Exec(cleanCtx, "DELETE FROM backup_targets WHERE id = $1", target.ID)
+	})
+
+	// Test connection via stored target_id
+	resp, raw = doReq(http.MethodPost, "/api/v1/targets/test-connection", TestConnectionRequest{
+		TargetID: &target.ID,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("test-connection(target_id) status = %d, want 200 (body=%s)", resp.StatusCode, string(raw))
+	}
+
+	job, _ := queue.EnqueueJob(ctx, pool, target.ID, 3, time.Now().UTC())
+	art, err := db.CreateArtifact(ctx, pool, db.BackupArtifact{
+		JobID:              job.ID,
+		TargetID:           target.ID,
+		ObjectKey:          objectKey,
+		WrappedDEK:         wrappedDEK,
+		PlaintextBytes:     stats.PlaintextBytes,
+		CiphertextBytes:    stats.CiphertextBytes,
+		CiphertextSHA256:   stats.CiphertextSHA256,
+		PGMajorVersion:     16,
+		VerificationPassed: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateArtifact() error: %v", err)
+	}
+
+	// Raw ciphertext download
+	resp, raw = doReq(http.MethodGet, fmt.Sprintf("/api/v1/artifacts/%d/download", art.ID), nil)
+	if resp.StatusCode != http.StatusOK || !bytes.Equal(raw, encBuf.Bytes()) {
+		t.Fatalf("GET /artifacts/%d/download failed: status=%d len=%d", art.ID, resp.StatusCode, len(raw))
+	}
+
+	// Decrypted stream download
+	resp, raw = doReq(http.MethodGet, fmt.Sprintf("/api/v1/artifacts/%d/decrypt", art.ID), nil)
+	if resp.StatusCode != http.StatusOK || !bytes.Equal(raw, plaintext) {
+		t.Fatalf("GET /artifacts/%d/decrypt failed: status=%d body=%q", art.ID, resp.StatusCode, string(raw))
+	}
+
+	// Mark pruned -> must return 410 Gone
+	if err := db.MarkArtifactPruned(ctx, pool, art.ID, time.Now().UTC()); err != nil {
+		t.Fatalf("MarkArtifactPruned() error: %v", err)
+	}
+	resp, _ = doReq(http.MethodGet, fmt.Sprintf("/api/v1/artifacts/%d/decrypt", art.ID), nil)
+	if resp.StatusCode != http.StatusGone {
+		t.Fatalf("GET pruned artifact /decrypt status = %d, want 410", resp.StatusCode)
 	}
 }

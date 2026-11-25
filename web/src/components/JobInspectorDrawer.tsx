@@ -2,11 +2,13 @@
 
 import { useEffect, useState } from "react";
 import { formatBytes, formatTimestamp, Job } from "@/lib/api";
-import { CheckIcon, CopyIcon, XIcon } from "@/components/Icons";
+import { CheckIcon, CopyIcon, DownloadIcon, XIcon } from "@/components/Icons";
 
 interface JobInspectorDrawerProps {
   job: Job | null;
   targetName: string;
+  downloadingKey: string | null;
+  onDownloadArtifact: (artifactId: number, decrypted: boolean) => Promise<void>;
   onClose: () => void;
 }
 
@@ -25,7 +27,13 @@ function statusBadgeClass(status: string): string {
   }
 }
 
-export function JobInspectorDrawer({ job, targetName, onClose }: JobInspectorDrawerProps) {
+export function JobInspectorDrawer({
+  job,
+  targetName,
+  downloadingKey,
+  onDownloadArtifact,
+  onClose,
+}: JobInspectorDrawerProps) {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   useEffect(() => {
@@ -123,7 +131,39 @@ export function JobInspectorDrawer({ job, targetName, onClose }: JobInspectorDra
 
           {/* Restore Verification & Artifact */}
           <div className="form-section">
-            <div className="form-section-title">Restore Verification &amp; Artifact</div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+              <div className="form-section-title">Restore Verification &amp; Artifact</div>
+              {job.artifact && (
+                <div className="actions-inline">
+                  <button
+                    type="button"
+                    className="btn btn-xs"
+                    disabled={
+                      Boolean(job.artifact.pruned_at) ||
+                      downloadingKey === `${job.artifact.id}-raw`
+                    }
+                    title={job.artifact.pruned_at ? "Artifact has been pruned from S3" : "Download encrypted .pgv ciphertext"}
+                    onClick={() => void onDownloadArtifact(job.artifact!.id, false)}
+                  >
+                    <DownloadIcon />
+                    {downloadingKey === `${job.artifact.id}-raw` ? "Downloading..." : "Download (.pgv)"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-xs"
+                    disabled={
+                      Boolean(job.artifact.pruned_at) ||
+                      downloadingKey === `${job.artifact.id}-dec`
+                    }
+                    title={job.artifact.pruned_at ? "Artifact has been pruned from S3" : "Stream-decrypt and download .dump"}
+                    onClick={() => void onDownloadArtifact(job.artifact!.id, true)}
+                  >
+                    <DownloadIcon />
+                    {downloadingKey === `${job.artifact.id}-dec` ? "Decrypting..." : "Decrypted (.dump)"}
+                  </button>
+                </div>
+              )}
+            </div>
             {job.artifact ? (
               <div className="kv-grid">
                 <div className="kv-item">
@@ -181,6 +221,22 @@ export function JobInspectorDrawer({ job, targetName, onClose }: JobInspectorDra
                   </div>
                   <div className="kv-value mono">{job.artifact.ciphertext_sha256}</div>
                 </div>
+                {job.artifact.wrapped_dek_base64 && (
+                  <div className="kv-item full">
+                    <div className="kv-label" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span>Wrapped DEK (Base64 · Offline DR)</span>
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-xs"
+                        onClick={() => void copyText("wrapped_dek", job.artifact!.wrapped_dek_base64!)}
+                      >
+                        {copiedKey === "wrapped_dek" ? <CheckIcon /> : <CopyIcon />}
+                        {copiedKey === "wrapped_dek" ? "Copied" : "Copy"}
+                      </button>
+                    </div>
+                    <div className="kv-value mono">{job.artifact.wrapped_dek_base64}</div>
+                  </div>
+                )}
                 {job.artifact.pruned_at && (
                   <div className="kv-item full">
                     <div className="kv-label">Pruned At</div>

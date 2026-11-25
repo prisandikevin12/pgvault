@@ -1,4 +1,3 @@
-
 # Build artifacts & local env
 web/node_modules/
 web/.next/
@@ -6,5 +5,6 @@ web/out/
 *.exe
 *.test
 .env
+.env.local
 .env.*
 !.env.example

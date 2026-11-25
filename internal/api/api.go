@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,31 +23,56 @@ import (
 	"github.com/prisandikevin12/pgvault/internal/notify"
 	"github.com/prisandikevin12/pgvault/internal/pgdump"
 	"github.com/prisandikevin12/pgvault/internal/queue"
+	"github.com/prisandikevin12/pgvault/internal/storage"
 	"github.com/prisandikevin12/pgvault/internal/verifier"
 )
 
 const (
-	maxRequestBodyBytes = 1 << 20 // 1 MiB
-	defaultIntervalSec  = 86400
-	defaultMaxAttempts  = 3
+	maxRequestBodyBytes  = 1 << 20 // 1 MiB
+	defaultIntervalSec   = 86400
+	defaultMaxAttempts   = 3
+	testConnectionTimout = 5 * time.Second
 )
+
+// ErrArtifactNotFound is returned by ArtifactLookupFunc when an artifact ID does not exist.
+var ErrArtifactNotFound = errors.New("api: artifact not found")
+
+// StreamDownloader abstracts downloading an S3 object stream (satisfied by *storage.Client).
+type StreamDownloader interface {
+	DownloadStream(ctx context.Context, key string) (io.ReadCloser, error)
+}
+
+// PingTargetFunc tests connectivity to a PostgreSQL DSN and returns server version and latency in ms.
+type PingTargetFunc func(ctx context.Context, dsn string) (serverVersion string, latencyMs int64, err error)
+
+// ArtifactLookupFunc loads an artifact and its owning target by artifact ID.
+type ArtifactLookupFunc func(ctx context.Context, id int64) (*db.BackupArtifact, *db.BackupTarget, error)
+
+// StreamDownloaderFunc constructs a StreamDownloader for a BackupTarget.
+type StreamDownloaderFunc func(ctx context.Context, target db.BackupTarget) (StreamDownloader, error)
 
 // Config configures the HTTP API server.
 type Config struct {
-	KEK            []byte
-	APIKey         string
-	AllowedOrigins []string
-	Logger         *slog.Logger
+	KEK                []byte
+	APIKey             string
+	AllowedOrigins     []string
+	Logger             *slog.Logger
+	PingTargetFn       PingTargetFunc
+	ArtifactLookupFn   ArtifactLookupFunc
+	StreamDownloaderFn StreamDownloaderFunc
 }
 
 // Server serves the PGVault REST API.
 type Server struct {
-	pool           *pgxpool.Pool
-	kek            []byte
-	apiKey         string
-	allowedOrigins map[string]bool
-	logger         *slog.Logger
-	handler        http.Handler
+	pool               *pgxpool.Pool
+	kek                []byte
+	apiKey             string
+	allowedOrigins     map[string]bool
+	logger             *slog.Logger
+	pingTargetFn       PingTargetFunc
+	artifactLookupFn   ArtifactLookupFunc
+	streamDownloaderFn StreamDownloaderFunc
+	handler            http.Handler
 }
 
 // ParseCORSOrigins parses a comma-separated list of CORS origins, trimming whitespace
@@ -91,11 +118,23 @@ func NewServer(pool *pgxpool.Pool, cfg Config) (*Server, error) {
 	copy(kekCopy, cfg.KEK)
 
 	s := &Server{
-		pool:           pool,
-		kek:            kekCopy,
-		apiKey:         strings.TrimSpace(cfg.APIKey),
-		allowedOrigins: originSet,
-		logger:         logger,
+		pool:               pool,
+		kek:                kekCopy,
+		apiKey:             strings.TrimSpace(cfg.APIKey),
+		allowedOrigins:     originSet,
+		logger:             logger,
+		pingTargetFn:       cfg.PingTargetFn,
+		artifactLookupFn:   cfg.ArtifactLookupFn,
+		streamDownloaderFn: cfg.StreamDownloaderFn,
+	}
+	if s.pingTargetFn == nil {
+		s.pingTargetFn = defaultPingTarget
+	}
+	if s.artifactLookupFn == nil {
+		s.artifactLookupFn = s.defaultLookupArtifact
+	}
+	if s.streamDownloaderFn == nil {
+		s.streamDownloaderFn = s.defaultStreamDownloader
 	}
 	s.handler = s.buildHandler()
 	return s, nil
@@ -114,6 +153,7 @@ func (s *Server) buildHandler() http.Handler {
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("GET /api/v1/targets", s.handleListTargets)
 	apiMux.HandleFunc("POST /api/v1/targets", s.handleCreateTarget)
+	apiMux.HandleFunc("POST /api/v1/targets/test-connection", s.handleTestConnection)
 	apiMux.HandleFunc("GET /api/v1/targets/{id}", s.handleGetTarget)
 	apiMux.HandleFunc("PATCH /api/v1/targets/{id}", s.handleUpdateTarget)
 	apiMux.HandleFunc("DELETE /api/v1/targets/{id}", s.handleDeleteTarget)
@@ -121,6 +161,8 @@ func (s *Server) buildHandler() http.Handler {
 	apiMux.HandleFunc("GET /api/v1/jobs", s.handleListJobs)
 	apiMux.HandleFunc("GET /api/v1/jobs/{id}", s.handleGetJob)
 	apiMux.HandleFunc("GET /api/v1/artifacts", s.handleListArtifacts)
+	apiMux.HandleFunc("GET /api/v1/artifacts/{id}/download", s.handleDownloadArtifact)
+	apiMux.HandleFunc("GET /api/v1/artifacts/{id}/decrypt", s.handleDecryptArtifact)
 	apiMux.HandleFunc("GET /api/v1/alerts", s.handleListAlerts)
 	apiMux.HandleFunc("PUT /api/v1/alerts/telegram", s.handleUpsertTelegramAlert)
 
@@ -138,6 +180,7 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Authorization, X-API-Key, Content-Type")
+				w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition")
 				w.Header().Set("Access-Control-Max-Age", "600")
 			}
 		}
@@ -246,6 +289,17 @@ type TriggerBackupRequest struct {
 	MaxAttempts int `json:"max_attempts"`
 }
 
+type TestConnectionRequest struct {
+	DSN      string `json:"dsn"`
+	TargetID *int64 `json:"target_id,omitempty"`
+}
+
+type TestConnectionResponse struct {
+	OK            bool   `json:"ok"`
+	LatencyMs     int64  `json:"latency_ms"`
+	ServerVersion string `json:"server_version"`
+}
+
 type UpsertTelegramAlertRequest struct {
 	TargetID        *int64 `json:"target_id"`
 	BotToken        string `json:"bot_token"`
@@ -280,6 +334,7 @@ type ArtifactResponse struct {
 	JobID              int64                  `json:"job_id"`
 	TargetID           int64                  `json:"target_id"`
 	ObjectKey          string                 `json:"object_key"`
+	WrappedDEKBase64   string                 `json:"wrapped_dek_base64,omitempty"`
 	PlaintextBytes     int64                  `json:"plaintext_bytes"`
 	CiphertextBytes    int64                  `json:"ciphertext_bytes"`
 	CiphertextSHA256   string                 `json:"ciphertext_sha256"`
@@ -349,11 +404,16 @@ func toArtifactResponse(a db.BackupArtifact) ArtifactResponse {
 	if tables == nil {
 		tables = []pgdump.TableSnapshot{}
 	}
+	wrappedB64 := ""
+	if len(a.WrappedDEK) > 0 {
+		wrappedB64 = base64.StdEncoding.EncodeToString(a.WrappedDEK)
+	}
 	return ArtifactResponse{
 		ID:                 a.ID,
 		JobID:              a.JobID,
 		TargetID:           a.TargetID,
 		ObjectKey:          a.ObjectKey,
+		WrappedDEKBase64:   wrappedB64,
 		PlaintextBytes:     a.PlaintextBytes,
 		CiphertextBytes:    a.CiphertextBytes,
 		CiphertextSHA256:   a.CiphertextSHA256,
@@ -792,6 +852,260 @@ func (s *Server) handleListArtifacts(w http.ResponseWriter, r *http.Request) {
 		out = append(out, toArtifactResponse(a))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"artifacts": out})
+}
+
+func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
+	var req TestConnectionRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	dsn := strings.TrimSpace(req.DSN)
+	if dsn == "" && req.TargetID != nil && *req.TargetID > 0 {
+		if s.pool == nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "database unavailable")
+			return
+		}
+		target, err := db.GetTarget(r.Context(), s.pool, *req.TargetID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				writeJSONError(w, http.StatusNotFound, "target not found")
+				return
+			}
+			s.internalError(w, "load target for test connection", err)
+			return
+		}
+		dsn, err = db.UnprotectSecret(s.kek, target.TargetDSN)
+		if err != nil {
+			s.internalError(w, "unprotect target DSN", err)
+			return
+		}
+	}
+	if dsn == "" {
+		writeJSONError(w, http.StatusBadRequest, "dsn or target_id is required")
+		return
+	}
+
+	connCfg, parseErr := pgx.ParseConfig(dsn)
+	if parseErr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": redactDSNError(parseErr, dsn, ""),
+		})
+		return
+	}
+
+	pingCtx, cancel := context.WithTimeout(r.Context(), testConnectionTimout)
+	defer cancel()
+
+	serverVersion, latencyMs, err := s.pingTargetFn(pingCtx, dsn)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"ok":    false,
+			"error": redactDSNError(err, dsn, connCfg.Password),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, TestConnectionResponse{
+		OK:            true,
+		LatencyMs:     latencyMs,
+		ServerVersion: serverVersion,
+	})
+}
+
+func defaultPingTarget(ctx context.Context, dsn string) (string, int64, error) {
+	connCfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return "", 0, err
+	}
+	start := time.Now()
+	conn, err := pgx.ConnectConfig(ctx, connCfg)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = conn.Close(closeCtx)
+	}()
+
+	var one int
+	if err := conn.QueryRow(ctx, "SELECT 1").Scan(&one); err != nil {
+		return "", 0, err
+	}
+	var version string
+	if err := conn.QueryRow(ctx, "SHOW server_version;").Scan(&version); err != nil {
+		return "", 0, err
+	}
+	latency := time.Since(start).Milliseconds()
+	if latency < 1 {
+		latency = 1
+	}
+	return strings.TrimSpace(version), latency, nil
+}
+
+func redactDSNError(err error, rawDSN, parsedPassword string) string {
+	msg := err.Error()
+	if parsedPassword != "" {
+		msg = strings.ReplaceAll(msg, parsedPassword, "[REDACTED]")
+	}
+	if u, parseErr := url.Parse(rawDSN); parseErr == nil && u.User != nil {
+		if pw, hasPw := u.User.Password(); hasPw && pw != "" {
+			msg = strings.ReplaceAll(msg, pw, "[REDACTED]")
+		}
+	}
+	return notify.SanitizeMessage(msg)
+}
+
+func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) {
+	decrypted := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("decrypted")), "true") ||
+		strings.TrimSpace(r.URL.Query().Get("decrypted")) == "1"
+	s.serveArtifactStream(w, r, decrypted)
+}
+
+func (s *Server) handleDecryptArtifact(w http.ResponseWriter, r *http.Request) {
+	s.serveArtifactStream(w, r, true)
+}
+
+func (s *Server) serveArtifactStream(w http.ResponseWriter, r *http.Request, decrypted bool) {
+	id, err := parsePathID(r, "id")
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	artifact, target, err := s.artifactLookupFn(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, ErrArtifactNotFound) || errors.Is(err, pgx.ErrNoRows) {
+			writeJSONError(w, http.StatusNotFound, "artifact not found")
+			return
+		}
+		if errors.Is(err, errDBUnavailable) {
+			writeJSONError(w, http.StatusServiceUnavailable, "database unavailable")
+			return
+		}
+		s.internalError(w, "lookup artifact", err)
+		return
+	}
+
+	if artifact.PrunedAt != nil {
+		writeJSONError(w, http.StatusGone, "artifact has been pruned from object storage")
+		return
+	}
+
+	var dek []byte
+	if decrypted {
+		dek, err = crypto.UnwrapDEK(s.kek, artifact.WrappedDEK)
+		if err != nil {
+			writeJSONError(w, http.StatusUnprocessableEntity, "failed to unwrap artifact DEK")
+			return
+		}
+		defer clear(dek)
+	}
+
+	downloader, err := s.streamDownloaderFn(r.Context(), *target)
+	if err != nil {
+		s.internalError(w, "init artifact storage downloader", err)
+		return
+	}
+
+	rc, err := downloader.DownloadStream(r.Context(), artifact.ObjectKey)
+	if err != nil {
+		if storage.IsNotFoundError(err) {
+			writeJSONError(w, http.StatusNotFound, "artifact object not found in storage")
+			return
+		}
+		writeJSONError(w, http.StatusBadGateway, "failed to download artifact from storage")
+		return
+	}
+	defer rc.Close()
+
+	ext := "pgv"
+	if decrypted {
+		ext = "dump"
+	}
+	filename := fmt.Sprintf("pgvault-artifact-%d.%s", artifact.ID, ext)
+
+	commitHeaders := func() {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusOK)
+	}
+
+	if !decrypted {
+		commitHeaders()
+		if _, err := io.Copy(w, rc); err != nil {
+			s.logger.Warn("stream artifact ciphertext interrupted", "artifact_id", artifact.ID, "error", notify.SanitizeMessage(err.Error()))
+		}
+		return
+	}
+
+	dw := &deferredHeaderWriter{w: w, onFirstWrite: commitHeaders}
+	if err := crypto.DecryptStream(rc, dw, dek); err != nil {
+		if !dw.committed {
+			writeJSONError(w, http.StatusBadGateway, "failed to decrypt artifact stream: integrity check failed")
+			return
+		}
+		s.logger.Warn("stream artifact decryption interrupted mid-response", "artifact_id", artifact.ID, "error", notify.SanitizeMessage(err.Error()))
+		return
+	}
+	// Handle 0-byte decrypted streams cleanly
+	if !dw.committed {
+		commitHeaders()
+	}
+}
+
+var errDBUnavailable = errors.New("api: database unavailable")
+
+func (s *Server) defaultLookupArtifact(ctx context.Context, id int64) (*db.BackupArtifact, *db.BackupTarget, error) {
+	if s.pool == nil {
+		return nil, nil, errDBUnavailable
+	}
+	art, err := db.GetArtifactByID(ctx, s.pool, id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, ErrArtifactNotFound
+		}
+		return nil, nil, err
+	}
+	target, err := db.GetTarget(ctx, s.pool, art.TargetID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return art, target, nil
+}
+
+func (s *Server) defaultStreamDownloader(ctx context.Context, target db.BackupTarget) (StreamDownloader, error) {
+	secretKey, err := db.UnprotectSecret(s.kek, target.StorageSecretKey)
+	if err != nil {
+		return nil, err
+	}
+	return storage.NewClient(ctx, storage.Config{
+		EndpointURL:     target.StorageEndpoint,
+		Region:          target.StorageRegion,
+		Bucket:          target.StorageBucket,
+		AccessKeyID:     target.StorageAccessKey,
+		SecretAccessKey: secretKey,
+		ForcePathStyle:  target.StorageForcePathStyle,
+	})
+}
+
+type deferredHeaderWriter struct {
+	w            http.ResponseWriter
+	onFirstWrite func()
+	committed    bool
+}
+
+func (d *deferredHeaderWriter) Write(p []byte) (int, error) {
+	if !d.committed {
+		d.onFirstWrite()
+		d.committed = true
+	}
+	return d.w.Write(p)
 }
 
 func (s *Server) handleListAlerts(w http.ResponseWriter, r *http.Request) {

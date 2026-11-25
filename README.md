@@ -1,21 +1,35 @@
 # PGVault
 
-Zero-knowledge, streaming PostgreSQL backup & automated restore verification platform written in Go with a Next.js control plane dashboard.
+Zero-knowledge, streaming PostgreSQL backup, automated Docker restore verification, retention pruning, and dark observability control plane—written in Go & Next.js.
+
+## 2-Step Quickstart
+
+```bash
+git clone https://github.com/prisandikevin12/pgvault.git && cd pgvault
+./quickstart.sh
+```
+
+`quickstart.sh` automatically:
+1. Generates a secure local `.env` (`PGVAULT_KEK_HEX`, `PGVAULT_API_KEY`, random PostgreSQL password, and `DOCKER_GID`) if one does not exist.
+2. Builds and starts the complete stack (`app-db`, `target-db` demo database, LocalStack S3 with auto-created `pgvault-backups` bucket, `api`, `worker`, and `web`).
+3. Pre-configures the dashboard (`http://localhost:3000`) to auto-connect and authenticate cleanly—no manual setup required.
+
+---
 
 ## Key Features
 
-- **Zero-Disk Streaming Backups (`internal/pgdump`)**: Streams `pg_dump --format=custom --no-owner --no-privileges` directly through in-memory `io.Pipe` chains into AES-256-GCM encryption and S3 multipart upload—no plaintext dump files are ever written to disk.
-- **Envelope Encryption & Chunked AEAD (`internal/crypto`)**:
-  - Generates a fresh 32-byte random DEK per backup and wraps it with a 32-byte KEK via AES-256-GCM.
-  - Streams 64 KiB chunks in `PGV1` format with header AAD authentication, per-chunk nonces (`noncePrefix || chunkIndex || finalFlag`), truncation detection (including 0-byte streams), chunk reordering protection, trailing-byte rejection, and on-the-fly ciphertext SHA-256 hashing.
-- **S3 / Cloudflare R2 Compatible Storage (`internal/storage`)**: Multipart streaming uploads via `aws-sdk-go-v2` with automatic multipart abort (`LeavePartsOnError: false`) on context cancellation or stream failure.
-- **Automated Ephemeral Docker Restore Verification (`internal/verifier`)**:
-  - Spins up an isolated temporary `postgres:<major>-alpine` container with `NetworkMode: "none"` and strict CPU/Memory/PID limits.
-  - Streams S3 ciphertext -> `DecryptStream` -> `pg_restore --exit-on-error`, verifies restored user table counts, and runs optional read-only sanity queries (`BEGIN TRANSACTION READ ONLY` + `SET LOCAL statement_timeout = '5s'`).
-  - Always removes the container and its anonymous volumes in `defer` (`Force: true, RemoveVolumes: true`).
-- **Concurrency-Safe PostgreSQL Job Queue (`internal/queue`)**: Uses `SELECT ... FOR UPDATE SKIP LOCKED` with retry exponential backoff and state transition validation.
-- **Credential-Safe Telegram Alerting (`internal/notify`)**: Dispatches backup/verification success & failure notifications while redacting DB passwords, S3 secrets, KEK/DEK values, and Telegram bot tokens.
-- **REST API & Next.js Dashboard (`internal/api`, `cmd/api`, `web/`)**: Manage targets, trigger backups, inspect jobs & verified artifacts, and configure Telegram alerts across localhost or remote VPS/domain hosts.
+- **Zero-Disk Streaming Backups (`internal/pgdump`)**: Pipes `pg_dump --format=custom --no-owner --no-privileges` directly through in-memory `io.Pipe` -> AES-256-GCM encryption -> S3 multipart upload. Plaintext dumps never touch disk.
+- **Envelope Encryption & Chunked AEAD (`internal/crypto`)**: Fresh 32-byte random DEK per backup wrapped with your 32-byte KEK (`AES-256-GCM`), streaming 64 KiB `PGV1` chunks with header AAD authentication, per-chunk nonces (`noncePrefix || chunkIndex || finalFlag`), truncation/reordering protection, and on-the-fly SHA-256 checksums.
+- **Automated Ephemeral Docker Restore Verification (`internal/verifier`)**: Launches an isolated `postgres:<major>-alpine` container (`NetworkMode: "none"`, CPU/Memory/PID limits), streams S3 -> `DecryptStream` -> `pg_restore --exit-on-error`, verifies restored table counts, runs optional read-only sanity queries (`BEGIN READ ONLY` + `5s` timeout), and guarantees container + volume cleanup.
+- **Auto-Scheduler, Stale Lease Recovery & S3 Retention Pruning (`internal/queue`, `cmd/worker`)**:
+  - Concurrency-safe `FOR UPDATE SKIP LOCKED` scheduling (`PGVAULT_SCHEDULER_INTERVAL`) and job claiming.
+  - Worker lease expiry (`PGVAULT_JOB_LEASE_DURATION`) automatically recovers crashed/stuck jobs.
+  - Per-target retention policies (`retention_keep_last` and `retention_max_age_days`) prune expired S3/R2 objects first and mark `pruned_at` in PostgreSQL.
+- **Live Connection Tester, Streaming Download/Decrypt & Offline DR (`internal/api`, `cmd/pgvault-decrypt`)**:
+  - `POST /api/v1/targets/test-connection` verifies PostgreSQL reachability and server version with a 5s timeout without ever leaking credentials.
+  - `GET /api/v1/artifacts/{id}/download` and `/decrypt` stream encrypted `.pgv` or decrypted `.dump` files straight from S3/R2 without temp files.
+  - `cmd/pgvault-decrypt` decrypts `.pgv` backups completely offline with zero server dependency.
+- **High-Density Dark Observability Control Plane (`web/`)**: Linear/Vercel-inspired dark UI with slide-over target creation/editing, live Test Connection, execution inspector drawer (`lease_expires_at`, restore latency, copyable error logs), one-click `.pgv` / `.dump` downloads, and Telegram alert configuration.
 
 ---
 
@@ -23,125 +37,89 @@ Zero-knowledge, streaming PostgreSQL backup & automated restore verification pla
 
 ```mermaid
 flowchart LR
-    UI["Next.js Dashboard (web)"] -->|REST + Bearer/X-API-Key| API["PGVault API (cmd/api)"]
-    API -->|Targets / Jobs / Alerts| APPDB[("App PostgreSQL")]
-    WORKER["PGVault Worker (cmd/worker)"] -->|FOR UPDATE SKIP LOCKED| APPDB
-    TARGETDB[("Target PostgreSQL")] -->|pg_dump custom stdout| PIPE1["io.Pipe"]
-    PIPE1 -->|chunked AES-256-GCM| CRYPTO["internal/crypto"]
-    CRYPTO -->|io.Pipe| S3[("S3 / Cloudflare R2")]
-    WORKER -->|orchestrates| CRYPTO
+    UI["Next.js Control Plane (web)"] -->|REST + Bearer/X-API-Key| API["PGVault API (cmd/api)"]
+    API -->|Targets / Jobs / Artifacts / Alerts| APPDB[("App PostgreSQL")]
+    API -.->|Stream Download & Decrypt| S3[("S3 / Cloudflare R2")]
+    WORKER["PGVault Worker (cmd/worker)"] -->|SKIP LOCKED Queue / Scheduler / Lease Recovery| APPDB
+    TARGETDB[("Target PostgreSQL")] -->|pg_dump custom stdout| PIPE["io.Pipe -> AES-256-GCM -> io.Pipe"]
+    PIPE -->|Multipart Upload| S3
     S3 -->|DownloadStream -> DecryptStream| VERIFIER["Ephemeral Docker PG (NetworkMode: none)"]
-    WORKER -->|pg_restore + sanity query| VERIFIER
-    WORKER -->|sanitized alerts| TG["Telegram Bot API"]
+    WORKER -->|pg_restore + read-only sanity query| VERIFIER
+    WORKER -->|Retention Auto-Prune| S3
+    WORKER -->|Redacted Alerts| TG["Telegram Bot API"]
 ```
-
----
-
-## Generating Keys (`KEK` & `API Key`)
-
-Generate a fresh 32-byte (64-hex-char) Key Encryption Key and API key using OpenSSL:
-
-```bash
-# 32-byte Key Encryption Key (PGVAULT_KEK_HEX)
-openssl rand -hex 32
-
-# API authentication key (PGVAULT_API_KEY)
-openssl rand -hex 32
-```
-
-> **Important**: Store `PGVAULT_KEK_HEX` securely (e.g. secret manager / encrypted vault). Losing the KEK prevents unwrapping stored DEKs and target credentials.
-
----
-
-## Running Locally (Development)
-
-### 1. Start Dev Infrastructure (`app-db`, `target-db`, LocalStack S3)
-
-```bash
-docker compose up -d
-```
-
-### 2. Run API & Worker
-
-```bash
-export PGVAULT_DB_DSN="postgres://pgvault:pgvault_dev_password@127.0.0.1:5432/pgvault?sslmode=disable"
-export PGVAULT_KEK_HEX="$(openssl rand -hex 32)"
-export PGVAULT_API_KEY="dev-secret-key"
-export PGVAULT_CORS_ORIGINS="http://localhost:3000,http://127.0.0.1:3000"
-
-# Terminal 1: API server (listens on :8080)
-go run ./cmd/api
-
-# Terminal 2: Worker engine
-go run ./cmd/worker
-```
-
-### 3. Run Next.js Dashboard
-
-```bash
-cd web
-npm install
-npm run dev
-```
-
-Open `http://localhost:3000`, enter your API Base URL (`http://127.0.0.1:8080`) and API Key (`dev-secret-key`), and start adding targets.
 
 ---
 
 ## Production / Cross-Host VPS Deployment
 
-PGVault supports non-localhost / cross-host deployments (remote RDS, Cloud SQL, Neon, self-hosted PostgreSQL over private/public IP or domain with `sslmode=require|verify-ca|verify-full`, AWS S3, Cloudflare R2, or MinIO).
-
-### 1. Configure `.env`
+PGVault works across remote hosts (AWS RDS, Cloud SQL, Neon, self-hosted PostgreSQL over private/public IPs or domains with `sslmode=require|verify-ca|verify-full`, AWS S3, Cloudflare R2, and MinIO).
 
 ```bash
 cp .env.example .env
-```
+# Generate fresh 32-byte keys:
+openssl rand -hex 32   # -> PGVAULT_KEK_HEX
+openssl rand -hex 32   # -> PGVAULT_API_KEY
+stat -c '%g' /var/run/docker.sock   # -> DOCKER_GID
 
-Edit `.env` and fill in strong production values:
-- `POSTGRES_PASSWORD` & `PGVAULT_DB_DSN` (uses internal `app-db:5432` hostname)
-- `PGVAULT_KEK_HEX` (`openssl rand -hex 32`)
-- `PGVAULT_API_KEY` (`openssl rand -hex 32`)
-- `PGVAULT_CORS_ORIGINS`: comma-separated dashboard origins, e.g. `https://pgvault.example.com`
-- `NEXT_PUBLIC_API_URL`: public API URL reachable by the browser (e.g. `https://api.pgvault.example.com`, or leave empty if serving API + Web under the same reverse-proxy origin)
-- `DOCKER_GID`: Docker socket group ID on the host (`stat -c '%g' /var/run/docker.sock`)
-
-### 2. Build & Launch with Production Compose
-
-```bash
+# Set PGVAULT_CORS_ORIGINS=https://pgvault.example.com
+# Set NEXT_PUBLIC_API_URL=https://api.pgvault.example.com
 docker compose -f docker-compose.prod.yml up -d --build
 ```
 
-Services started:
-- `app-db`: PostgreSQL 16 with persistent volume `pgvault_app_db_data` (internal network only, not exposed to the internet).
-- `api`: Non-root minimal container serving the REST API on `${PGVAULT_API_PORT:-8080}`.
-- `worker`: Non-root container with `postgresql17-client` (`pg_dump`/`pg_restore`) and `/var/run/docker.sock` mounted for isolated `NetworkMode: "none"` verification containers.
-- `web`: Non-root Next.js production server on `${PGVAULT_WEB_PORT:-3000}`.
-
-Place a TLS reverse proxy (Caddy, Nginx, or Traefik) in front of `api` and `web` for HTTPS in production.
+> **Security Note**: Store `PGVAULT_KEK_HEX` in an external secret manager or offline vault. Without the KEK, wrapped DEKs and encrypted backups cannot be decrypted. For public multi-user production deployments, leave `NEXT_PUBLIC_API_KEY` empty and supply the API key via the dashboard's **Connection** popover.
 
 ---
 
-## Testing
+## Disaster Recovery (Offline Decryption Without Server)
 
-### Unit Tests (No External Services Required)
+If your PGVault control plane (`api`, `worker`, `app-db`) is completely unavailable, you can still recover any `.pgv` backup directly from S3/R2 using only:
+1. The encrypted `.pgv` file downloaded from S3/R2.
+2. Your 64-hex-character `PGVAULT_KEK_HEX`.
+3. The artifact's KEK-encrypted `wrapped_dek` (copied from the Execution Inspector or queried from `backup_artifacts`: `SELECT id, object_key, encode(wrapped_dek, 'base64') FROM backup_artifacts;`).
+
+Decrypt directly to a `.dump` file:
 
 ```bash
+export PGVAULT_KEK_HEX="<your-64-hex-char-kek>"
+go run ./cmd/pgvault-decrypt \
+  --in backup.pgv \
+  --wrapped-dek "<base64-or-hex-wrapped-dek>" \
+  --out restored.dump
+
+pg_restore --no-owner --no-privileges --dbname="postgres://user:pass@host:5432/mydb" restored.dump
+```
+
+Or stream straight into `pg_restore` with zero plaintext written to disk:
+
+```bash
+export PGVAULT_KEK_HEX="<your-64-hex-char-kek>"
+go run ./cmd/pgvault-decrypt \
+  --in backup.pgv \
+  --wrapped-dek "<base64-or-hex-wrapped-dek>" \
+  --out - | pg_restore --no-owner --no-privileges --dbname="postgres://user:pass@host:5432/mydb"
+```
+
+---
+
+## Testing & Verification
+
+```bash
+# Unit tests (no Docker required)
 go vet ./...
 go test -v -race ./...
-```
 
-### Integration Tests (Requires `docker compose up -d`)
-
-```bash
-docker compose up -d
+# Full integration tests (requires app-db, target-db, s3)
+docker compose up -d app-db target-db s3
 go test -v -race -tags=integration ./...
+
+# Build all Go binaries
+go build ./...
+
+# Build Next.js dashboard
+cd web && npm ci && npm run build
 ```
 
-### Frontend Type-Check & Production Build
+## License
 
-```bash
-cd web
-npm ci
-npm run build
-```
+MIT License — see [LICENSE](LICENSE).

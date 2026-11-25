@@ -448,6 +448,30 @@ func MarkArtifactPruned(ctx context.Context, pool *pgxpool.Pool, artifactID int6
 	return nil
 }
 
+// GetArtifactByID fetches a backup artifact by its primary ID.
+func GetArtifactByID(ctx context.Context, pool *pgxpool.Pool, id int64) (*BackupArtifact, error) {
+	var out BackupArtifact
+	var rawTables []byte
+	err := pool.QueryRow(ctx, `
+		SELECT id, job_id, target_id, object_key, wrapped_dek, plaintext_bytes,
+			ciphertext_bytes, ciphertext_sha256, pg_major_version, tables_json,
+			verification_passed, restore_duration_ms, verification_error, pruned_at, created_at
+		FROM backup_artifacts
+		WHERE id = $1
+	`, id).Scan(
+		&out.ID, &out.JobID, &out.TargetID, &out.ObjectKey, &out.WrappedDEK, &out.PlaintextBytes,
+		&out.CiphertextBytes, &out.CiphertextSHA256, &out.PGMajorVersion, &rawTables,
+		&out.VerificationPassed, &out.RestoreDurationMs, &out.VerificationError, &out.PrunedAt, &out.CreatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("db: get artifact %d: %w", id, err)
+	}
+	if err := json.Unmarshal(rawTables, &out.Tables); err != nil {
+		return nil, fmt.Errorf("db: unmarshal tables_json: %w", err)
+	}
+	return &out, nil
+}
+
 // GetArtifactByJobID fetches the backup artifact produced by a specific job.
 func GetArtifactByJobID(ctx context.Context, pool *pgxpool.Pool, jobID int64) (*BackupArtifact, error) {
 	var out BackupArtifact

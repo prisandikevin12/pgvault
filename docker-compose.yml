@@ -2,23 +2,25 @@ services:
   app-db:
     image: postgres:16-alpine
     container_name: pgvault-app-db
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: pgvault
-      POSTGRES_PASSWORD: pgvault_dev_password
-      POSTGRES_DB: pgvault
+      POSTGRES_USER: ${POSTGRES_USER:-pgvault}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pgvault_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-pgvault}
     ports:
       - "5432:5432"
     volumes:
       - app_db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pgvault -d pgvault"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pgvault} -d ${POSTGRES_DB:-pgvault}"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   target-db:
     image: postgres:16-alpine
     container_name: pgvault-target-db
+    restart: unless-stopped
     environment:
       POSTGRES_USER: target_admin
       POSTGRES_PASSWORD: target_dev_password
@@ -31,17 +33,95 @@ services:
       test: ["CMD-SHELL", "pg_isready -U target_admin -d customer_app"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   s3:
     image: localstack/localstack:3.8.1
     container_name: pgvault-s3
+    restart: unless-stopped
     environment:
       SERVICES: s3
     ports:
       - "4566:4566"
     volumes:
       - s3_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -q '\"s3\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  s3-init:
+    image: curlimages/curl:8.11.1
+    container_name: pgvault-s3-init
+    depends_on:
+      s3:
+        condition: service_healthy
+    restart: "no"
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        curl -fsS -X PUT "http://s3:4566/${PGVAULT_DEFAULT_BUCKET:-pgvault-backups}" >/dev/null
+        echo "Ensured S3 bucket: ${PGVAULT_DEFAULT_BUCKET:-pgvault-backups}"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    container_name: pgvault-api
+    restart: unless-stopped
+    depends_on:
+      app-db:
+        condition: service_healthy
+    environment:
+      PGVAULT_DB_DSN: ${PGVAULT_DB_DSN:-postgres://pgvault:pgvault_dev_password@app-db:5432/pgvault?sslmode=disable}
+      PGVAULT_KEK_HEX: ${PGVAULT_KEK_HEX:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+      PGVAULT_API_KEY: ${PGVAULT_API_KEY:-}
+      PGVAULT_API_ADDR: ${PGVAULT_API_ADDR:-:8080}
+      PGVAULT_CORS_ORIGINS: ${PGVAULT_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+    ports:
+      - "${PGVAULT_API_PORT:-8080}:8080"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    container_name: pgvault-worker
+    restart: unless-stopped
+    depends_on:
+      app-db:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+    environment:
+      PGVAULT_DB_DSN: ${PGVAULT_DB_DSN:-postgres://pgvault:pgvault_dev_password@app-db:5432/pgvault?sslmode=disable}
+      PGVAULT_KEK_HEX: ${PGVAULT_KEK_HEX:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+      PGVAULT_WORKER_ID: ${PGVAULT_WORKER_ID:-pgvault-worker-1}
+      PGVAULT_POLL_INTERVAL: ${PGVAULT_POLL_INTERVAL:-5s}
+      PGVAULT_SCHEDULER_INTERVAL: ${PGVAULT_SCHEDULER_INTERVAL:-15s}
+      PGVAULT_PRUNE_INTERVAL: ${PGVAULT_PRUNE_INTERVAL:-1m}
+      PGVAULT_JOB_LEASE_DURATION: ${PGVAULT_JOB_LEASE_DURATION:-15m}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-999}"
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+        NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-}
+    container_name: pgvault-web
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${PGVAULT_WEB_PORT:-3000}:3000"
 
 volumes:
   app_db_data:

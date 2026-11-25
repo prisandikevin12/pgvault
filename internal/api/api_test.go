@@ -1,13 +1,19 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prisandikevin12/pgvault/internal/crypto"
+	"github.com/prisandikevin12/pgvault/internal/db"
 )
 
 func newTestServer(t *testing.T, apiKey string) *Server {
@@ -375,4 +381,249 @@ func TestValidateCreateTargetInput(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHandleTestConnection_Unit(t *testing.T) {
+	kek, _ := crypto.GenerateDEK()
+	const apiKey = "test-conn-key"
+
+	t.Run("success", func(t *testing.T) {
+		srv, err := NewServer(nil, Config{
+			KEK:    kek,
+			APIKey: apiKey,
+			PingTargetFn: func(_ context.Context, _ string) (string, int64, error) {
+				return "16.4 (Debian 16.4-1)", 12, nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewServer() error: %v", err)
+		}
+
+		body := `{"dsn":"postgres://admin:SuperSecretPass!@db.example.com:5432/app?sslmode=require"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/targets/test-connection", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+		}
+		var resp TestConnectionResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if !resp.OK || resp.ServerVersion != "16.4 (Debian 16.4-1)" || resp.LatencyMs != 12 {
+			t.Fatalf("unexpected response: %+v", resp)
+		}
+	})
+
+	t.Run("missing_dsn_returns_400", func(t *testing.T) {
+		srv, _ := NewServer(nil, Config{KEK: kek, APIKey: apiKey})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/targets/test-connection", strings.NewReader(`{}`))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", rec.Code)
+		}
+	})
+
+	t.Run("invalid_dsn_returns_400_without_password_leak", func(t *testing.T) {
+		srv, _ := NewServer(nil, Config{KEK: kek, APIKey: apiKey})
+		body := `{"dsn":"postgres://admin:UltraSecretPW99@host:notaport/db"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/targets/test-connection", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "UltraSecretPW99") {
+			t.Fatalf("SECURITY VIOLATION: 400 error leaked DSN password: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("connection_failure_returns_502_without_password_leak", func(t *testing.T) {
+		srv, _ := NewServer(nil, Config{
+			KEK:    kek,
+			APIKey: apiKey,
+			PingTargetFn: func(_ context.Context, dsn string) (string, int64, error) {
+				return "", 0, errors.New("dial failed for " + dsn + " password=UltraSecretPW99")
+			},
+		})
+		body := `{"dsn":"postgres://admin:UltraSecretPW99@db.example.com:5432/app?sslmode=require"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/targets/test-connection", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502 (body=%s)", rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "UltraSecretPW99") {
+			t.Fatalf("SECURITY VIOLATION: 502 error leaked DSN password: %s", rec.Body.String())
+		}
+	})
+}
+
+type fakeStreamDownloader struct {
+	data map[string][]byte
+}
+
+func (f *fakeStreamDownloader) DownloadStream(_ context.Context, key string) (io.ReadCloser, error) {
+	b, ok := f.data[key]
+	if !ok {
+		return nil, errors.New("NoSuchKey")
+	}
+	return io.NopCloser(bytes.NewReader(b)), nil
+}
+
+func TestHandleArtifactDownloadAndDecrypt_Unit(t *testing.T) {
+	kek, _ := crypto.GenerateDEK()
+	dek, _ := crypto.GenerateDEK()
+	wrappedDEK, _ := crypto.WrapDEK(kek, dek)
+
+	plaintext := []byte("PGDMP_TEST_BACKUP_CONTENT_FOR_STREAMING_DECRYPT_12345")
+	var cipherBuf bytes.Buffer
+	if _, err := crypto.EncryptStream(bytes.NewReader(plaintext), &cipherBuf, dek, 1024); err != nil {
+		t.Fatalf("EncryptStream() error: %v", err)
+	}
+	ciphertext := cipherBuf.Bytes()
+
+	prunedNow := time.Now().UTC()
+	artifacts := map[int64]*db.BackupArtifact{
+		1: {
+			ID:         1,
+			JobID:      10,
+			TargetID:   100,
+			ObjectKey:  "backups/valid.pgv1",
+			WrappedDEK: wrappedDEK,
+		},
+		2: {
+			ID:         2,
+			JobID:      11,
+			TargetID:   100,
+			ObjectKey:  "backups/pruned.pgv1",
+			WrappedDEK: wrappedDEK,
+			PrunedAt:   &prunedNow,
+		},
+		3: {
+			ID:         3,
+			JobID:      12,
+			TargetID:   100,
+			ObjectKey:  "backups/corrupt.pgv1",
+			WrappedDEK: wrappedDEK,
+		},
+	}
+
+	corrupt := append([]byte(nil), ciphertext...)
+	corrupt[len(corrupt)-1] ^= 0xFF
+
+	downloader := &fakeStreamDownloader{
+		data: map[string][]byte{
+			"backups/valid.pgv1":   ciphertext,
+			"backups/corrupt.pgv1": corrupt,
+		},
+	}
+
+	const apiKey = "dl-key"
+	srv, err := NewServer(nil, Config{
+		KEK:    kek,
+		APIKey: apiKey,
+		ArtifactLookupFn: func(_ context.Context, id int64) (*db.BackupArtifact, *db.BackupTarget, error) {
+			art, ok := artifacts[id]
+			if !ok {
+				return nil, nil, ErrArtifactNotFound
+			}
+			return art, &db.BackupTarget{ID: 100, Name: "prod"}, nil
+		},
+		StreamDownloaderFn: func(_ context.Context, _ db.BackupTarget) (StreamDownloader, error) {
+			return downloader, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServer() error: %v", err)
+	}
+
+	t.Run("download_ciphertext", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/1/download", nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+		}
+		if !bytes.Equal(rec.Body.Bytes(), ciphertext) {
+			t.Fatalf("downloaded ciphertext mismatch")
+		}
+		if !strings.Contains(rec.Header().Get("Content-Disposition"), ".pgv") {
+			t.Errorf("Content-Disposition = %q, want .pgv filename", rec.Header().Get("Content-Disposition"))
+		}
+	})
+
+	t.Run("decrypt_endpoint", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/1/decrypt", nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+		}
+		if !bytes.Equal(rec.Body.Bytes(), plaintext) {
+			t.Fatalf("decrypted output mismatch: got %q, want %q", rec.Body.String(), string(plaintext))
+		}
+		if !strings.Contains(rec.Header().Get("Content-Disposition"), ".dump") {
+			t.Errorf("Content-Disposition = %q, want .dump filename", rec.Header().Get("Content-Disposition"))
+		}
+	})
+
+	t.Run("download_with_decrypted_query_param", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/1/download?decrypted=true", nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), plaintext) {
+			t.Fatalf("status=%d, body mismatch", rec.Code)
+		}
+	})
+
+	t.Run("pruned_artifact_returns_410", func(t *testing.T) {
+		for _, path := range []string{"/api/v1/artifacts/2/download", "/api/v1/artifacts/2/decrypt"} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusGone {
+				t.Errorf("%s status = %d, want 410 Gone", path, rec.Code)
+			}
+		}
+	})
+
+	t.Run("not_found_returns_404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/999/download", nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", rec.Code)
+		}
+	})
+
+	t.Run("corrupted_ciphertext_fails_decrypt", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/3/decrypt", nil)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+
+		if rec.Code == http.StatusOK {
+			t.Fatalf("expected non-200 status for corrupted ciphertext, got 200")
+		}
+	})
 }

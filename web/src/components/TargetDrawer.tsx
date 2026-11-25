@@ -1,8 +1,8 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
-import { CreateTargetInput, Target, UpdateTargetInput } from "@/lib/api";
-import { XIcon } from "@/components/Icons";
+import { CreateTargetInput, Target, TestConnectionResult, UpdateTargetInput } from "@/lib/api";
+import { PlugIcon, XIcon } from "@/components/Icons";
 
 interface TargetDrawerProps {
   open: boolean;
@@ -11,6 +11,7 @@ interface TargetDrawerProps {
   onClose: () => void;
   onCreate: (input: CreateTargetInput) => Promise<void>;
   onUpdate: (id: number, input: UpdateTargetInput) => Promise<void>;
+  onTestConnection: (input: { dsn?: string; target_id?: number }) => Promise<TestConnectionResult>;
 }
 
 export function TargetDrawer({
@@ -20,11 +21,14 @@ export function TargetDrawer({
   onClose,
   onCreate,
   onUpdate,
+  onTestConnection,
 }: TargetDrawerProps) {
   const isEdit = editingTarget !== null;
 
   const [name, setName] = useState("");
   const [targetDSN, setTargetDSN] = useState("");
+  const [testingConn, setTestingConn] = useState(false);
+  const [connResult, setConnResult] = useState<TestConnectionResult | null>(null);
   const [storageEndpoint, setStorageEndpoint] = useState("");
   const [storageRegion, setStorageRegion] = useState("us-east-1");
   const [storageBucket, setStorageBucket] = useState("");
@@ -38,6 +42,8 @@ export function TargetDrawer({
 
   useEffect(() => {
     if (!open) return;
+    setConnResult(null);
+    setTestingConn(false);
     if (editingTarget) {
       setName(editingTarget.name);
       setTargetDSN("");
@@ -162,7 +168,10 @@ export function TargetDrawer({
                 className="input mono"
                 type="password"
                 value={targetDSN}
-                onChange={(e) => setTargetDSN(e.target.value)}
+                onChange={(e) => {
+                  setTargetDSN(e.target.value);
+                  setConnResult(null);
+                }}
                 placeholder={
                   isEdit
                     ? "Leave blank to preserve existing encrypted DSN"
@@ -170,6 +179,50 @@ export function TargetDrawer({
                 }
                 required={!isEdit}
               />
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 4 }}>
+                <button
+                  type="button"
+                  className="btn btn-xs"
+                  disabled={testingConn || (!targetDSN.trim() && !isEdit)}
+                  onClick={async () => {
+                    setTestingConn(true);
+                    setConnResult(null);
+                    try {
+                      const payload =
+                        targetDSN.trim() !== ""
+                          ? { dsn: targetDSN.trim() }
+                          : { target_id: editingTarget?.id };
+                      const res = await onTestConnection(payload);
+                      setConnResult(res);
+                    } catch (err) {
+                      setConnResult({
+                        ok: false,
+                        error: err instanceof Error ? err.message : "Connection test failed",
+                      });
+                    } finally {
+                      setTestingConn(false);
+                    }
+                  }}
+                >
+                  <PlugIcon />
+                  {testingConn ? "Testing..." : "Test Connection"}
+                </button>
+                {connResult && connResult.ok && (
+                  <span className="badge badge-emerald mono">
+                    PG {connResult.server_version} · {connResult.latency_ms}ms
+                  </span>
+                )}
+                {connResult && !connResult.ok && (
+                  <span className="badge badge-rose" title={connResult.error}>
+                    Failed
+                  </span>
+                )}
+              </div>
+              {connResult && !connResult.ok && connResult.error && (
+                <div className="mono" style={{ color: "var(--rose)", fontSize: 11.5, marginTop: 2 }}>
+                  {connResult.error}
+                </div>
+              )}
             </div>
           </div>
 

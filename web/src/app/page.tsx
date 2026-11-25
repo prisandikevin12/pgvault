@@ -9,6 +9,7 @@ import {
   createTarget,
   CreateTargetInput,
   deleteTarget,
+  downloadArtifact,
   formatBytes,
   formatInterval,
   formatRelativeTime,
@@ -20,7 +21,9 @@ import {
   listJobs,
   listTargets,
   resolveDefaultApiBaseUrl,
+  resolveDefaultApiKey,
   Target,
+  testTargetConnection,
   triggerBackup,
   updateTarget,
   UpdateTargetInput,
@@ -33,6 +36,7 @@ import {
   CheckIcon,
   CopyIcon,
   DatabaseIcon,
+  DownloadIcon,
   MenuIcon,
   PlayIcon,
   PlugIcon,
@@ -93,6 +97,7 @@ function renderJobStatusBadge(job: Job) {
 
 export default function ControlPlanePage() {
   const [defaultUrl, setDefaultUrl] = useState("http://127.0.0.1:8080");
+  const [defaultKey, setDefaultKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("http://127.0.0.1:8080");
   const [apiKey, setApiKey] = useState("");
   const [configLoaded, setConfigLoaded] = useState(false);
@@ -122,8 +127,9 @@ export default function ControlPlanePage() {
   const [savingTarget, setSavingTarget] = useState(false);
   const [inspectedJobId, setInspectedJobId] = useState<number | null>(null);
 
-  // Copy feedback for artifact hashes
+  // Copy & download feedback for artifacts
   const [copiedHashId, setCopiedHashId] = useState<number | null>(null);
+  const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
 
   // Telegram Alerts form state
   const [alertTargetId, setAlertTargetId] = useState<string>("global");
@@ -136,11 +142,13 @@ export default function ControlPlanePage() {
 
   useEffect(() => {
     const resolvedDefault = resolveDefaultApiBaseUrl();
+    const resolvedDefaultKey = resolveDefaultApiKey();
     setDefaultUrl(resolvedDefault);
+    setDefaultKey(resolvedDefaultKey);
     const savedUrl = window.localStorage.getItem(STORAGE_KEY_URL);
     const savedKey = window.localStorage.getItem(STORAGE_KEY_API_KEY);
     setBaseUrl(savedUrl && savedUrl.trim() !== "" ? savedUrl : resolvedDefault);
-    if (savedKey) setApiKey(savedKey);
+    setApiKey(savedKey !== null ? savedKey : resolvedDefaultKey);
     setConfigLoaded(true);
   }, []);
 
@@ -294,9 +302,22 @@ export default function ControlPlanePage() {
     window.localStorage.removeItem(STORAGE_KEY_URL);
     window.localStorage.removeItem(STORAGE_KEY_API_KEY);
     setBaseUrl(defaultUrl);
-    setApiKey("");
+    setApiKey(defaultKey);
     setSuccessBanner(`Reset API connection to default (${defaultUrl})`);
-    void refreshAll({ baseUrl: defaultUrl, apiKey: "" });
+    void refreshAll({ baseUrl: defaultUrl, apiKey: defaultKey });
+  };
+
+  const handleDownloadArtifact = async (artifactId: number, decrypted: boolean) => {
+    const opKey = `${artifactId}-${decrypted ? "dec" : "raw"}`;
+    setDownloadingKey(opKey);
+    setErrorBanner(null);
+    try {
+      await downloadArtifact(apiCfg, artifactId, decrypted);
+    } catch (err) {
+      setErrorBanner(err instanceof Error ? err.message : "Failed to download artifact");
+    } finally {
+      setDownloadingKey(null);
+    }
   };
 
   const openCreateTargetDrawer = () => {
@@ -978,12 +999,13 @@ export default function ControlPlanePage() {
                       <th>SHA-256</th>
                       <th>Restore Verification</th>
                       <th>Lifecycle</th>
+                      <th style={{ textAlign: "right" }}>Download</th>
                     </tr>
                   </thead>
                   <tbody>
                     {filteredArtifacts.length === 0 ? (
                       <tr>
-                        <td colSpan={7} className="empty-cell">
+                        <td colSpan={8} className="empty-cell">
                           No backup artifacts recorded yet.
                         </td>
                       </tr>
@@ -1051,6 +1073,42 @@ export default function ControlPlanePage() {
                               ) : (
                                 <span className="badge badge-emerald">Stored</span>
                               )}
+                            </td>
+                            <td style={{ textAlign: "right" }}>
+                              <div className="actions-inline">
+                                <button
+                                  type="button"
+                                  className="btn btn-xs"
+                                  disabled={
+                                    Boolean(a.pruned_at) || downloadingKey === `${a.id}-raw`
+                                  }
+                                  title={
+                                    a.pruned_at
+                                      ? "Artifact pruned from object storage"
+                                      : "Download encrypted .pgv ciphertext"
+                                  }
+                                  onClick={() => void handleDownloadArtifact(a.id, false)}
+                                >
+                                  <DownloadIcon />
+                                  {downloadingKey === `${a.id}-raw` ? "..." : ".pgv"}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn btn-primary btn-xs"
+                                  disabled={
+                                    Boolean(a.pruned_at) || downloadingKey === `${a.id}-dec`
+                                  }
+                                  title={
+                                    a.pruned_at
+                                      ? "Artifact pruned from object storage"
+                                      : "Download decrypted .dump stream"
+                                  }
+                                  onClick={() => void handleDownloadArtifact(a.id, true)}
+                                >
+                                  <DownloadIcon />
+                                  {downloadingKey === `${a.id}-dec` ? "..." : ".dump"}
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         );
@@ -1241,6 +1299,7 @@ export default function ControlPlanePage() {
         }}
         onCreate={handleCreateTarget}
         onUpdate={handleUpdateTarget}
+        onTestConnection={(input) => testTargetConnection(apiCfg, input)}
       />
 
       {/* Execution Detail Inspector Drawer */}
@@ -1251,6 +1310,8 @@ export default function ControlPlanePage() {
             ? targetById.get(inspectedJob.target_id)?.name ?? `target-#${inspectedJob.target_id}`
             : ""
         }
+        downloadingKey={downloadingKey}
+        onDownloadArtifact={handleDownloadArtifact}
         onClose={() => setInspectedJobId(null)}
       />
     </div>

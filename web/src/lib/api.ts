@@ -59,6 +59,7 @@ export interface Artifact {
   job_id: number;
   target_id: number;
   object_key: string;
+  wrapped_dek_base64?: string;
   plaintext_bytes: number;
   ciphertext_bytes: number;
   ciphertext_sha256: string;
@@ -120,6 +121,13 @@ export interface HealthStatus {
   latencyMs: number;
 }
 
+export interface TestConnectionResult {
+  ok: boolean;
+  latency_ms?: number;
+  server_version?: string;
+  error?: string;
+}
+
 export function resolveDefaultApiBaseUrl(): string {
   const envUrl = process.env.NEXT_PUBLIC_API_URL?.trim();
   if (envUrl) {
@@ -132,6 +140,10 @@ export function resolveDefaultApiBaseUrl(): string {
     }
   }
   return "http://127.0.0.1:8080";
+}
+
+export function resolveDefaultApiKey(): string {
+  return (process.env.NEXT_PUBLIC_API_KEY ?? "").trim();
 }
 
 async function request<T>(
@@ -232,6 +244,81 @@ export async function triggerBackup(cfg: APIConfig, targetId: number): Promise<J
     method: "POST",
     body: JSON.stringify({}),
   });
+}
+
+export async function testTargetConnection(
+  cfg: APIConfig,
+  input: { dsn?: string; target_id?: number }
+): Promise<TestConnectionResult> {
+  const base = cfg.baseUrl.replace(/\/+$/, "");
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (cfg.apiKey.trim() !== "") {
+    headers.set("Authorization", `Bearer ${cfg.apiKey.trim()}`);
+  }
+  const res = await fetch(`${base}/api/v1/targets/test-connection`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(input),
+    cache: "no-store",
+  });
+  const text = await res.text();
+  let parsed: TestConnectionResult = { ok: false };
+  try {
+    parsed = JSON.parse(text) as TestConnectionResult;
+  } catch {
+    parsed = { ok: false, error: `HTTP ${res.status} ${res.statusText}` };
+  }
+  if (!res.ok) {
+    return {
+      ok: false,
+      error: parsed.error || `HTTP ${res.status} ${res.statusText}`,
+    };
+  }
+  return parsed;
+}
+
+export async function downloadArtifact(
+  cfg: APIConfig,
+  artifactId: number,
+  decrypted: boolean
+): Promise<void> {
+  const base = cfg.baseUrl.replace(/\/+$/, "");
+  const headers = new Headers();
+  if (cfg.apiKey.trim() !== "") {
+    headers.set("Authorization", `Bearer ${cfg.apiKey.trim()}`);
+  }
+  const endpoint = decrypted
+    ? `${base}/api/v1/artifacts/${artifactId}/decrypt`
+    : `${base}/api/v1/artifacts/${artifactId}/download`;
+
+  const res = await fetch(endpoint, { method: "GET", headers, cache: "no-store" });
+  if (!res.ok) {
+    const text = await res.text();
+    let msg = `HTTP ${res.status} ${res.statusText}`;
+    try {
+      const parsed = JSON.parse(text) as { error?: string };
+      if (parsed.error) msg = parsed.error;
+    } catch {
+      // ignore non-JSON body
+    }
+    throw new Error(msg);
+  }
+
+  const blob = await res.blob();
+  const disposition = res.headers.get("Content-Disposition") ?? "";
+  const match = disposition.match(/filename="?([^"]+)"?/i);
+  const filename =
+    (match && match[1]) ||
+    `pgvault-artifact-${artifactId}.${decrypted ? "dump" : "pgv"}`;
+
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
 }
 
 export async function listJobs(cfg: APIConfig): Promise<Job[]> {
